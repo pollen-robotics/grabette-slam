@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0
           lfs: true
 
-      - name: Ensure Space exists
+      - name: Push to HF Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -31,23 +31,6 @@ jobs:
             echo "::error::HF_TOKEN secret is not set in repo Settings → Secrets and variables → Actions"
             exit 1
           fi
-          pip install --quiet huggingface_hub
-          python - <<'PY'
-          import os
-          from huggingface_hub import create_repo
-          create_repo(
-              os.environ["SPACE"],
-              repo_type="space",
-              space_sdk="docker",
-              exist_ok=True,
-              token=os.environ["HF_TOKEN"],
-          )
-          PY
-
-      - name: Push to HF Space
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
           URL="https://pollen-robotics:${HF_TOKEN}@huggingface.co/spaces/${SPACE}"
           # Dedicated branch-tracking Space: always mirror the branch tip.
           git push --force "$URL" HEAD:main
