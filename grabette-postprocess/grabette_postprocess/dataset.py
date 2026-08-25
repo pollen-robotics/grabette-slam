@@ -19,6 +19,7 @@ from grabette_postprocess.trajectory import (
     load_trajectory_csv,
     trajectory_to_poses,
     interpolate_angles,
+    load_tactile_streams,
 )
 
 # Feature schema for the GRABETTE dataset
@@ -325,6 +326,8 @@ def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int]) -> dict:
     cam1_ts = _load_oak_left_timestamps(ep_dir)
     if cam1_ts is None:
         raise ValueError(f"no depth-camera left timestamps in {ep_dir}")
+    tactile_path = ep_dir / "tactile_data.json"
+    tactile = load_tactile_streams(tactile_path) if tactile_path.is_file() 
     return {
         "dir": ep_dir,
         "traj_ts": traj_ts,
@@ -335,7 +338,45 @@ def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int]) -> dict:
         "cam1_path": resolve(ep_dir, "dcam_left.mp4"),
         "cam1_ts": cam1_ts,
         "started": _load_capture_started(ep_dir),
+        "tactile": tactile,   # {addr: (cts_s (M,), vals (M, rows, cols))}, {} if none
     }
+
+
+def _tactile_config_multi(
+    groups: dict[str, dict[str, Path]], roles: list[str],
+) -> dict[str, dict[int, tuple[int, int]]]:
+    """Per-role {addr: (rows, cols)} for the roles whose tactile can be exported.
+
+    A role qualifies only if EVERY built group (one that has all `roles`) carries
+    a tactile_data.json for that role with an identical sensor config — the
+    LeRobot feature schema is fixed for the whole dataset, so a role's tactile
+    columns must be present and uniform across all its episodes or be omitted.
+    Roles that don't qualify are simply left out (others can still export).
+    """
+    built = [g for g in groups.values() if all(r in g for r in roles)]
+    cfg_by_role: dict[str, dict[int, tuple[int, int]]] = {}
+    for r in roles:
+        reference: dict[int, tuple[int, int]] | None = None
+        ok = True
+        for group in built:
+            path = Path(group[r]) / "tactile_data.json"
+            if not path.is_file():
+                ok = False
+                break
+            with open(path) as f:
+                sensors = json.load(f).get("sensors", {})
+            cfg = {int(a): (s["rows"], s["cols"]) for a, s in sensors.items()}
+            if reference is None:
+                reference = cfg
+            elif cfg != reference:
+                ok = False
+                break
+        if ok and reference:
+            cfg_by_role[r] = reference
+            print(f"  Tactile[{r}]: {len(reference)} sensor(s) {reference}")
+        else:
+            print(f"  Tactile[{r}]: skipped (missing/inconsistent tactile_data.json)")
+    return cfg_by_role
 
 
 def build_dataset_multi(
@@ -389,6 +430,17 @@ def build_dataset_multi(
         "names": [f"{r}_is_lost" for r in roles],
     }
 
+    # Tactile: one int16 grid feature per (role, sensor), only for roles whose
+    # tactile is present and uniform across all episodes (see _tactile_config_multi).
+    tactile_cfg = _tactile_config_multi(groups, roles)
+    for role, sensors in tactile_cfg.items():
+        for addr, (rows, cols) in sensors.items():
+            features[f"observation.tactile.{role}_sensor_{addr}"] = {
+                "dtype": "int16",  # raw 12-bit ADC (0-4095) fits int16
+                "shape": (rows, cols),
+                "names": ["rows", "columns"],
+            }
+
     dataset = LeRobotDataset.create(
         repo_id=repo_id, fps=int(fps), features=features, root=root,
         robot_type="grabette", use_videos=True,
@@ -438,6 +490,8 @@ def build_dataset_multi(
         # reference role the shift is zero → maps back to its original indices.
         idxs: dict[str, tuple] = {}
         caches: dict[str, tuple] = {}
+        # Per role: {addr: (n_frames, rows, cols) int16} tactile aligned to ref_ts.
+        tactile_aligned: dict[str, dict[int, np.ndarray]] = {}
         for r in roles:
             a = arms[r]
             q = ref_ts + deltas[r]
@@ -449,6 +503,11 @@ def build_dataset_multi(
                 _load_video_frames_indexed(a["cam0_path"], image_size, set(cam0_idx.tolist())),
                 _load_video_frames_indexed(a["cam1_path"], image_size, set(cam1_idx.tolist())),
             )
+            tactile_aligned[r] = {}
+            for addr in tactile_cfg.get(r, {}):
+                cts, vals = a["tactile"][addr]
+                tac_idx = _nearest_frame_indices(q, cts)
+                tactile_aligned[r][addr] = vals[tac_idx].astype(np.int16)
 
         wrote = 0
         for i in range(n_frames):
@@ -465,6 +524,8 @@ def build_dataset_multi(
                     break
                 frame[f"observation.images.{r}_cam0"] = cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
                 frame[f"observation.images.{r}_cam1"] = cv2.cvtColor(im1, cv2.COLOR_BGR2RGB)
+                for addr, aligned in tactile_aligned.get(r, {}).items():
+                    frame[f"observation.tactile.{r}_sensor_{addr}"] = aligned[i]
                 ti = traj_idx[i]
                 act_parts.append(arms[r]["actions"][ti])
                 lost_parts.append(arms[r]["is_lost"][ti])
