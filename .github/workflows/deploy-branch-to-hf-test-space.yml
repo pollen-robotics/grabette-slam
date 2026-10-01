@@ -10,12 +10,21 @@ on:
         # silently deployed the wrong ref. Fill it in only to deploy a tag or SHA.
         description: 'Tag or SHA to deploy (leave empty to use the branch selected above)'
         required: false
+      space:
+        description: 'Target Space'
+        type: choice
+        options:
+          - pollen-robotics/grabette-slam-test
+          - CarolinePascal/grabette-slam
+        default: pollen-robotics/grabette-slam-test
 
 env:
-  SPACE: pollen-robotics/grabette-slam-test
+  SPACE: ${{ inputs.space }}
+  # Each Space owner needs its own write token: the pollen-robotics one cannot push elsewhere.
+  TOKEN_SECRET: ${{ inputs.space == 'CarolinePascal/grabette-slam' && 'HF_TOKEN_CAROLINE' || 'HF_TOKEN' }}
 
 concurrency:
-  group: hf-space-test
+  group: hf-space-${{ inputs.space }}
   cancel-in-progress: false
 
 jobs:
@@ -31,14 +40,14 @@ jobs:
 
       - name: Push to HF Space
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets[env.TOKEN_SECRET] }}
         run: |
           if [ -z "$HF_TOKEN" ]; then
-            echo "::error::HF_TOKEN secret is not set in repo Settings → Secrets and variables → Actions"
+            echo "::error::$TOKEN_SECRET secret is not set in repo Settings → Secrets and variables → Actions"
             exit 1
           fi
 
-          URL="https://pollen-robotics:${HF_TOKEN}@huggingface.co/spaces/${SPACE}"
+          URL="https://${SPACE%%/*}:${HF_TOKEN}@huggingface.co/spaces/${SPACE}"
 
           # Always --force: this Space is a scratch target, whatever ref was
           # deployed last is meant to be replaced.
@@ -53,7 +62,7 @@ jobs:
       # Writing a variable restarts the Space, which the push has queued anyway.
       - name: Stamp the deployed ref on the Space
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets[env.TOKEN_SECRET] }}
           REF: ${{ inputs.ref || github.ref_name }}
         run: |
           python3 -m pip install --quiet "huggingface_hub>=0.25"
