@@ -327,7 +327,7 @@ def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int]) -> dict:
     if cam1_ts is None:
         raise ValueError(f"no depth-camera left timestamps in {ep_dir}")
     tactile_path = ep_dir / "tactile_data.json"
-    tactile = load_tactile_streams(tactile_path) if tactile_path.is_file() 
+    tactile = load_tactile_streams(tactile_path) if tactile_path.is_file() else {} 
     return {
         "dir": ep_dir,
         "traj_ts": traj_ts,
