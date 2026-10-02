@@ -193,7 +193,7 @@ def _reset_view(sess):
             *inputs_view("idle"))
 
 
-def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess):
+def _run(source_repo, target_repo, task, run_sync, tactile, oauth_token, to_branch, sess):
     """Streaming generator behind Run / Push-to-branch. Yields the 16-element
     `outputs` tuple: bar, log, summary, retry_state, the 8 buttons, then the 4
     inputs-view fields. The episode-review panel is a separate reactive @gr.render
@@ -406,7 +406,8 @@ def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess)
                     raw, target_repo, task, root=ds_root,
                     log=print, should_stop=sess.stop.is_set, to_branch=to_branch,
                     on_progress=on_progress, token=token, gate=sess.wait_if_paused,
-                    pre_review=pre_review_cb, review=review_cb, run_sync=run_sync)
+                    pre_review=pre_review_cb, review=review_cb, run_sync=run_sync,
+                    tactile=tactile)
                 # Build done — dataset cached on disk; record it so that if the push
                 # fails, the "Retry push" button can reuse it (no re-running SLAM).
                 result["built"] = {"root": str(ds_root), "n": len(built)}
@@ -558,17 +559,17 @@ def retry_push(retry_ctx, oauth_token: gr.OAuthToken | None = None,
                state="finished", ctx=None)
 
 
-def run_pipeline(source_repo, target_repo, task, run_sync=False,
+def run_pipeline(source_repo, target_repo, task, run_sync=False, tactile=True,
                  oauth_token: gr.OAuthToken | None = None,
                  request: gr.Request = None):
-    yield from _run(source_repo, target_repo, task, run_sync, oauth_token,
+    yield from _run(source_repo, target_repo, task, run_sync, tactile, oauth_token,
                     to_branch=False, sess=session.get(request))
 
 
-def run_pipeline_branch(source_repo, target_repo, task, run_sync=False,
+def run_pipeline_branch(source_repo, target_repo, task, run_sync=False, tactile=True,
                         oauth_token: gr.OAuthToken | None = None,
                         request: gr.Request = None):
-    yield from _run(source_repo, target_repo, task, run_sync, oauth_token,
+    yield from _run(source_repo, target_repo, task, run_sync, tactile, oauth_token,
                     to_branch=True, sess=session.get(request))
 
 

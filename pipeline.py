@@ -99,7 +99,7 @@ def episode_label(ep: Path) -> str:
 
 
 def build_recordings(target_repo, task, root, episodes, report_by_ep,
-                     roles=None, source_user=None, log=print) -> list:
+                     roles=None, source_user=None, log=print, tactile=True) -> list:
     """Build the LeRobot dataset on disk from the kept episode dirs, picking the
     schema from the raw layout. Shared by the UI run (build_lerobot) and the
     headless REST run so both produce the SAME dataset for the same raw input.
@@ -107,6 +107,8 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
     roles: the device roles present, when the caller already knows them (the REST
         API is told by the fleet). None/empty → inferred from the layout via
         detect_roles.
+    tactile: export the tactile streams (role layout only; the legacy flat
+        schema has none).
 
     With roles → ONE uniform, role-prefixed schema for any arm count (mono is the
     single-role case: left_cam0/left_cam1 + 8D left action; bimanual adds the
@@ -153,7 +155,7 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
         f"{len(groups)} recording(s)…")
     build_dataset_multi(repo_id=target_repo, groups=groups, roles=roles, task=task,
                         root=Path(root), source_user=source_user,
-                        tags_by_recording=tags_by_recording)
+                        tags_by_recording=tags_by_recording, tactile=tactile)
     return sorted(groups)
 
 
@@ -404,7 +406,7 @@ def _push_to_branch(ds, target_repo, branch, log, token, attempts=3):
 def build_lerobot(dataset_dir, target_repo, task, root, log=print,
                   should_stop=None, to_branch=False, on_progress=None,
                   token=None, gate=None, pre_review=None, review=None,
-                  run_sync=False) -> list:
+                  run_sync=False, tactile=True) -> list:
     """Check + SLAM + build the LeRobot dataset on disk under `root`.
 
     Pipeline: completeness/sync prechecks → (pre_review drop) → convert+SLAM →
@@ -432,6 +434,7 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
         trajectory check came back flagged. When None, every episode is kept.
     run_sync: enable the debug-only sync diagnostics (pre-SLAM OAK cam↔gyro and
         post-SLAM image↔trajectory). Off by default.
+    tactile: export the tactile streams into the dataset. On by default.
     """
     # No global HF_TOKEN here: this function only builds locally and resolves the
     # username via an explicit HfApi(token=token).whoami() below; the actual push
@@ -503,7 +506,7 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
     # kept-but-flagged episodes stay filterable downstream.
     report_by_ep = {ep: report for ep, report in results}
     return build_recordings(target_repo, task, root, processed, report_by_ep,
-                            source_user=source_user, log=log)
+                            source_user=source_user, log=log, tactile=tactile)
 
 
 def push_lerobot(target_repo, task, root, n_episodes, to_branch=False,

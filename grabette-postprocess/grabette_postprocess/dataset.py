@@ -396,6 +396,7 @@ def build_dataset_multi(
     root: Path | None = None,
     source_user: str | None = None,
     tags_by_recording: dict[str, list[str]] | None = None,
+    tactile: bool = True,
 ):
     """Build a LeRobot v3 dataset with a uniform, role-prefixed schema for ONE OR
     MORE arms (roles). Mono is just the single-role case of this: a lone left
@@ -411,7 +412,8 @@ def build_dataset_multi(
         recording. A group missing any of `roles` is skipped (can't pair it).
     The arms of one recording share a wall clock (synchronized start); we align
     them frame-exactly via each recording's capture_started_utc, using the first
-    role as the reference timeline and sampling the others nearest-ts on it."""
+    role as the reference timeline and sampling the others nearest-ts on it.
+    tactile: export the tactile streams; False omits every tactile feature."""
     from lerobot.configs import RGBEncoderConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -439,7 +441,7 @@ def build_dataset_multi(
 
     # Tactile: one int16 grid feature per (role, sensor), only for roles whose
     # tactile is present and uniform across all episodes (see _tactile_config_multi).
-    tactile_cfg = _tactile_config_multi(groups, roles)
+    tactile_cfg = _tactile_config_multi(groups, roles) if tactile else {}
     for role, sensors in tactile_cfg.items():
         for addr, (rows, cols) in sensors.items():
             features[f"observation.tactile.{role}_sensor_{addr}"] = {

@@ -86,6 +86,9 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
             debug_sync = gr.Checkbox(
                 label="Run sync checks (debug)", value=False,
                 info="Extra camera↔IMU / image↔trajectory timing diagnostics")
+            export_tactile = gr.Checkbox(
+                label="Export tactile data", value=True,
+                info="Add the tactile sensor streams to the dataset")
             # Read-only recap of the inputs, shown in their place while running.
             selection_card = gr.HTML(visible=False)
             # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
@@ -144,10 +147,12 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
                confirm_branch_btn, retry_btn,
                run_btn, pause_btn, cancel_btn, confirm_cancel_btn, keep_btn, reset_btn,
                source, target, task, selection_card]
-    run_event = run_btn.click(run_pipeline, inputs=[source, target, task, debug_sync],
+    run_event = run_btn.click(run_pipeline,
+                              inputs=[source, target, task, debug_sync, export_tactile],
                               outputs=outputs)
     branch_event = confirm_branch_btn.click(run_pipeline_branch,
-                                            inputs=[source, target, task, debug_sync],
+                                            inputs=[source, target, task, debug_sync,
+                                                    export_tactile],
                                             outputs=outputs)
     retry_event = retry_btn.click(retry_push, inputs=[retry_state], outputs=outputs)
     reset_btn.click(reset, inputs=None, outputs=outputs)
@@ -199,6 +204,7 @@ class _ProcessReq(BaseModel):
     exclude_bad: bool = False
     private: bool = False
     run_sync: bool = False
+    tactile: bool = True
     # Device roles present in the raw dataset (e.g. ["left","right"]). >1 role
     # → bimanual build (each episode combines the arms, uploaded by the fleet to
     # {episode_id}/{role}/); ≤1 role (or empty) → the classic single-arm build.
@@ -224,6 +230,7 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                             exclude_bad: bool = False,
                             private: bool = False,
                             run_sync: bool = False,
+                            tactile: bool = True,
                             roles: list[str] | None = None,
                             keep_raw: bool = True,
                             check_only: bool = False) -> None:
@@ -233,6 +240,7 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
     exclude_bad:  drop all BAD episodes.
     private:      create the LeRobot dataset repo as private.
     run_sync:     enable the debug-only sync diagnostics (off by default).
+    tactile:      export the tactile streams into the dataset (on by default).
     keep_raw:     leave the raw source dataset alone (the default — nothing
                   auto-deletes a raw for now).
     check_only:   SLAM check — report quality, and push the dataset only if an
@@ -382,7 +390,8 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                     # original single-arm schema.
                     report_by_ep = {ep: rep for ep, rep in slam_results}
                     built = build_recordings(target_repo, task, ds_root, kept,
-                                             report_by_ep, roles=roles, log=log)
+                                             report_by_ep, roles=roles, log=log,
+                                             tactile=tactile)
                     n_built = len(built)
                     n, link, _mode = push_lerobot(target_repo, task, ds_root,
                                                   n_built, token=token, log=log,
@@ -447,7 +456,8 @@ async def api_process(req: _ProcessReq, authorization: str | None = Header(defau
         args=(job_id, req.source_repo.strip(), target_repo,
               req.task.strip(), token),
         kwargs={"exclude_fail": req.exclude_fail, "exclude_bad": req.exclude_bad,
-                "private": req.private, "run_sync": req.run_sync, "roles": req.roles,
+                "private": req.private, "run_sync": req.run_sync,
+                "tactile": req.tactile, "roles": req.roles,
                 "keep_raw": req.keep_raw, "check_only": check_only},
         daemon=True,
     )
