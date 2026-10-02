@@ -16,6 +16,7 @@ import pandas as pd
 from scipy.spatial.transform import Rotation
 
 DEFAULT_DOCKER_IMAGE = "pollenrobotics/oak-vslam"
+GRAVITY_WINDOW_S = 1.0
 
 # World rotation used when the camera has no IMU (Orbbec Gemini 305). Gravity
 # cannot be measured, so the world is assumed level and rotated by a constant.
@@ -54,16 +55,12 @@ class SlamResult:
 
 def _estimate_gravity_imu(imu_acc: pd.DataFrame, g_nominal: float = 9.81,
                           tol: float = 0.5) -> np.ndarray:
-    """Robust gravity estimate from a full episode's accel samples.
+    """Robust gravity estimate from accel samples.
 
     Filters samples whose magnitude is within `tol` m/s² of `g_nominal`
     (these are the "stationary-ish" frames where accel is dominated by
     gravity), then returns the median direction. Falls back to the median
     of all samples if too few pass the filter.
-
-    Much more robust than averaging the first N samples — those often
-    contain motion-induced accel from grabbing/lifting the device into
-    start position.
     """
     accel = imu_acc[["ax", "ay", "az"]].to_numpy()
     mags = np.linalg.norm(accel, axis=1)
@@ -91,8 +88,11 @@ def _gravity_align_trajectory(traj_df: pd.DataFrame, oak_dir: Path) -> pd.DataFr
     preserved exactly.
 
     With an IMU (OAK-D), gravity picks the rotation:
-      1. Robust gravity estimate from accel: median over samples whose
+      1. Robust gravity estimate from accel over the GRAVITY_WINDOW_S
+         following the first tracked pose: median over samples whose
          magnitude is close to 9.81 m/s² (excludes motion-induced accel).
+         Accel is in the moving body frame, so only samples taken at the
+         initial pose can be rotated through it in step 3.
       2. Transform to optical camera frame via calib's imu_to_cam.
       3. Rotate through the first pose's orientation to get gravity in
          the trajectory's world frame.
@@ -107,7 +107,10 @@ def _gravity_align_trajectory(traj_df: pd.DataFrame, oak_dir: Path) -> pd.DataFr
 
     try:
         imu_acc = pd.read_csv(oak_dir / "imu_acc.csv")
-        g_imu = _estimate_gravity_imu(imu_acc)
+        t0 = float(valid["timestamp"].iloc[0])
+        t_imu = imu_acc["timestamp_ns"] * 1e-9
+        initial = imu_acc[(t_imu >= t0) & (t_imu < t0 + GRAVITY_WINDOW_S)]
+        g_imu = _estimate_gravity_imu(initial if not initial.empty else imu_acc)
         calib = json.loads((oak_dir / "calib_offline.json").read_text())
         R_imu_to_cam = np.array(calib["imu_to_cam"])[:3, :3]
     except (FileNotFoundError, KeyError, ValueError) as e:
