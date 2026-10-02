@@ -352,6 +352,7 @@ def _tactile_config_multi(
     LeRobot feature schema is fixed for the whole dataset, so a role's tactile
     columns must be present and uniform across all its episodes or be omitted.
     Roles that don't qualify are simply left out (others can still export).
+    Raises ValueError if a declared sensor has no samples in some episode.
     """
     built = [g for g in groups.values() if all(r in g for r in roles)]
     cfg_by_role: dict[str, dict[int, tuple[int, int]]] = {}
@@ -365,6 +366,12 @@ def _tactile_config_multi(
                 break
             with open(path) as f:
                 sensors = json.load(f).get("sensors", {})
+            empty = [a for a, s in sensors.items() if not s.get("samples")]
+            if empty:
+                raise ValueError(
+                    f"Tactile sensor(s) {', '.join(empty)} recorded no samples in "
+                    f"episode {Path(group[r]).parent.name}/{r}. Check the tactile "
+                    "hardware, drop the episode, or disable tactile export.")
             cfg = {int(a): (s["rows"], s["cols"]) for a, s in sensors.items()}
             if reference is None:
                 reference = cfg
