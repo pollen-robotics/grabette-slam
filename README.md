@@ -10,6 +10,7 @@ hf_oauth_scopes:
   - read-repos
   - write-repos
   - manage-repos
+short_description: Convert Grabette recordings into a LeRobot dataset
 ---
 
 # Grabette SLAM → LeRobot

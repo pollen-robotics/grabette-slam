@@ -75,6 +75,55 @@ jobs:
               print(f"{key}={value}")
           PY
 
+      # The card shown in the org's Spaces grid is built from the README front
+      # matter — and prod and test deploy from the SAME tree, so out of the box
+      # both carry the same title, emoji and gradient and cannot be told apart.
+      # Override those fields on the Space only; the repo's README stays correct
+      # for prod. Re-applied on every deploy, because the --force push above
+      # discards the previous branding commit.
+      - name: Brand the test Space card
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python3 -m pip install --quiet "huggingface_hub>=0.25"
+          python3 - <<'PY'
+          import os
+
+          from huggingface_hub import HfApi
+
+          OVERRIDES = {
+              "title": "Grabette Slam (TEST)",
+              "emoji": "🧪",
+              "colorFrom": "gray",
+              "colorTo": "red",
+              "short_description": "Dev deployment — use pollen-robotics/grabette-slam",
+          }
+
+          _, front, body = open("README.md", encoding="utf-8").read().split("---", 2)
+
+          # Replace the keys we own; keep every other line verbatim (list items
+          # included, hence the leading-whitespace guard); append the ones the
+          # repo does not set.
+          kept, seen = [], set()
+          for line in front.strip("\n").splitlines():
+              key = line.split(":", 1)[0]
+              if not line[:1].isspace() and key in OVERRIDES:
+                  kept.append(f"{key}: {OVERRIDES[key]}")
+                  seen.add(key)
+              else:
+                  kept.append(line)
+          kept += [f"{k}: {v}" for k, v in OVERRIDES.items() if k not in seen]
+
+          HfApi(token=os.environ["HF_TOKEN"]).upload_file(
+              path_or_fileobj=("---\n" + "\n".join(kept) + "\n---" + body).encode(),
+              path_in_repo="README.md",
+              repo_id=os.environ["SPACE"],
+              repo_type="space",
+              commit_message="Brand the Space card as the TEST deployment",
+          )
+          print("card branded:", OVERRIDES["title"])
+          PY
+
       - name: Summary
         env:
           REF: ${{ inputs.ref || github.ref_name }}
