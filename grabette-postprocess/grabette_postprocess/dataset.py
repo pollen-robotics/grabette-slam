@@ -337,6 +337,25 @@ def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int]) -> dict:
     }
 
 
+# Camera-only "observer" arms: they contribute a POV video observation but have
+# no SLAM trajectory / gripper, so no action or is_lost. (The casquette watches
+# the scene; the eventual ArUco fusion consumes its RAW stream separately.)
+OBSERVER_ROLES = ("casquette",)
+
+
+def _load_observer_streams(ep_dir: Path, image_size: tuple[int, int]) -> dict:
+    """Load a camera-only observer arm (e.g. casquette): its POV video + per-frame
+    timestamps + capture-start clock. No trajectory/action — it's sampled onto the
+    reference (SLAM) arm's timeline via capture_started, like the SLAM cameras."""
+    ep_dir = Path(ep_dir).absolute()
+    return {
+        "dir": ep_dir,
+        "cam_path": ep_dir / "raw_video.mp4",
+        "cam_ts": _load_video_timestamps(ep_dir, ep_dir / "raw_video.mp4"),
+        "started": _load_capture_started(ep_dir),
+    }
+
+
 def build_dataset_multi(
     repo_id: str,
     groups: dict[str, dict[str, Path]],
@@ -370,21 +389,33 @@ def build_dataset_multi(
         print(f"Using default fps: {int(fps)}")
     h, w = image_size
 
+    slam_roles = [r for r in roles if r not in OBSERVER_ROLES]
+    obs_roles = [r for r in roles if r in OBSERVER_ROLES]
+    if not slam_roles:
+        raise RuntimeError(
+            f"build_dataset_multi needs at least one SLAM arm; got only {obs_roles}")
+
     features: dict = {}
-    for role in roles:
+    for role in slam_roles:
         for cam in ("cam0", "cam1"):
             features[f"observation.images.{role}_{cam}"] = {
                 "dtype": "video", "shape": (3, h, w),
                 "names": ["channels", "height", "width"],
             }
+    # Observer arms (e.g. casquette): a single POV camera, no action/state.
+    for role in obs_roles:
+        features[f"observation.images.{role}"] = {
+            "dtype": "video", "shape": (3, h, w),
+            "names": ["channels", "height", "width"],
+        }
     per = ["x", "y", "z", "ax", "ay", "az", "proximal", "distal"]
     features["action"] = {
-        "dtype": "float32", "shape": (8 * len(roles),),
-        "names": [f"{r}_{n}" for r in roles for n in per],
+        "dtype": "float32", "shape": (8 * len(slam_roles),),
+        "names": [f"{r}_{n}" for r in slam_roles for n in per],
     }
     features["is_lost"] = {
-        "dtype": "float32", "shape": (len(roles),),
-        "names": [f"{r}_is_lost" for r in roles],
+        "dtype": "float32", "shape": (len(slam_roles),),
+        "names": [f"{r}_is_lost" for r in slam_roles],
     }
 
     dataset = LeRobotDataset.create(
@@ -393,8 +424,14 @@ def build_dataset_multi(
         streaming_encoding=True,
     )
 
-    ref_role = roles[0]
+    # The reference timeline must be a SLAM arm (observers have no trajectory).
+    ref_role = slam_roles[0]
     saved: list[str] = []
+
+    def _timeline(a):
+        """An arm's own time axis: SLAM trajectory ts, or observer video ts."""
+        return a["cam_ts"] if "cam_ts" in a else a["traj_ts"]
+
     for ep_id in sorted(groups):
         group = groups[ep_id]
         missing = [r for r in roles if r not in group]
@@ -402,7 +439,11 @@ def build_dataset_multi(
             print(f"  Skipping {ep_id}: missing arm(s) {missing}")
             continue
         print(f"\nProcessing {ep_id} ({'+'.join(roles)})...")
-        arms = {r: _load_arm_streams(group[r], image_size) for r in roles}
+        arms = {
+            r: (_load_observer_streams(group[r], image_size) if r in OBSERVER_ROLES
+                else _load_arm_streams(group[r], image_size))
+            for r in roles
+        }
         ref = arms[ref_role]
         full_ref_ts = ref["traj_ts"]
 
@@ -419,11 +460,10 @@ def build_dataset_multi(
         # [first,last] on its own clock → [first - delta_r, last - delta_r] in
         # reference time. Keeping only reference frames inside the intersection
         # means every arm is sampled within its REAL range (no frozen first/last
-        # frame) and all arms get the SAME length (the overlap). With a
-        # synchronized start the low bound is ~0, so this effectively just cuts
-        # the longer arm's tail; it also guards the start if starts ever differ.
-        lo = max([full_ref_ts[0]] + [arms[r]["traj_ts"][0] - deltas[r] for r in roles])
-        hi = min([full_ref_ts[-1]] + [arms[r]["traj_ts"][-1] - deltas[r] for r in roles])
+        # frame) and all arms get the SAME length (the overlap). Observers use
+        # their video timeline in place of a trajectory.
+        lo = max([full_ref_ts[0]] + [_timeline(arms[r])[0] - deltas[r] for r in roles])
+        hi = min([full_ref_ts[-1]] + [_timeline(arms[r])[-1] - deltas[r] for r in roles])
         ref_ts = full_ref_ts[(full_ref_ts >= lo) & (full_ref_ts <= hi)]
         n_frames = len(ref_ts)
         if n_frames == 0:
@@ -438,33 +478,50 @@ def build_dataset_multi(
         for r in roles:
             a = arms[r]
             q = ref_ts + deltas[r]
-            traj_idx = _nearest_frame_indices(q, a["traj_ts"])
-            cam0_idx = _nearest_frame_indices(q, a["cam0_ts"])
-            cam1_idx = _nearest_frame_indices(q, a["cam1_ts"])
-            idxs[r] = (traj_idx, cam0_idx, cam1_idx)
-            caches[r] = (
-                _load_video_frames_indexed(a["cam0_path"], image_size, set(cam0_idx.tolist())),
-                _load_video_frames_indexed(a["cam1_path"], image_size, set(cam1_idx.tolist())),
-            )
+            if r in OBSERVER_ROLES:
+                cam_idx = _nearest_frame_indices(q, a["cam_ts"])
+                idxs[r] = (cam_idx,)
+                caches[r] = (
+                    _load_video_frames_indexed(a["cam_path"], image_size, set(cam_idx.tolist())),
+                )
+            else:
+                traj_idx = _nearest_frame_indices(q, a["traj_ts"])
+                cam0_idx = _nearest_frame_indices(q, a["cam0_ts"])
+                cam1_idx = _nearest_frame_indices(q, a["cam1_ts"])
+                idxs[r] = (traj_idx, cam0_idx, cam1_idx)
+                caches[r] = (
+                    _load_video_frames_indexed(a["cam0_path"], image_size, set(cam0_idx.tolist())),
+                    _load_video_frames_indexed(a["cam1_path"], image_size, set(cam1_idx.tolist())),
+                )
 
         wrote = 0
         for i in range(n_frames):
             frame: dict = {"task": task}
-            act_parts, lost_parts = [], []
             ok = True
-            for r in roles:
-                traj_idx, cam0_idx, cam1_idx = idxs[r]
-                cam0_cache, cam1_cache = caches[r]
-                im0 = cam0_cache.get(cam0_idx[i])
-                im1 = cam1_cache.get(cam1_idx[i])
-                if im0 is None or im1 is None:
+            # Observer arms first: a single POV image each, no action/state.
+            for r in obs_roles:
+                (cam_idx,) = idxs[r]
+                im = caches[r][0].get(cam_idx[i])
+                if im is None:
                     ok = False
                     break
-                frame[f"observation.images.{r}_cam0"] = cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
-                frame[f"observation.images.{r}_cam1"] = cv2.cvtColor(im1, cv2.COLOR_BGR2RGB)
-                ti = traj_idx[i]
-                act_parts.append(arms[r]["actions"][ti])
-                lost_parts.append(arms[r]["is_lost"][ti])
+                frame[f"observation.images.{r}"] = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+            # SLAM arms: two cameras + 8D action + is_lost, in slam_roles order.
+            act_parts, lost_parts = [], []
+            if ok:
+                for r in slam_roles:
+                    traj_idx, cam0_idx, cam1_idx = idxs[r]
+                    cam0_cache, cam1_cache = caches[r]
+                    im0 = cam0_cache.get(cam0_idx[i])
+                    im1 = cam1_cache.get(cam1_idx[i])
+                    if im0 is None or im1 is None:
+                        ok = False
+                        break
+                    frame[f"observation.images.{r}_cam0"] = cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
+                    frame[f"observation.images.{r}_cam1"] = cv2.cvtColor(im1, cv2.COLOR_BGR2RGB)
+                    ti = traj_idx[i]
+                    act_parts.append(arms[r]["actions"][ti])
+                    lost_parts.append(arms[r]["is_lost"][ti])
             if not ok:
                 print(f"  Warning: missing frame at step {i} for {ep_id}")
                 break
