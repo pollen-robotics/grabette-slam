@@ -24,6 +24,7 @@ import contextlib
 import os
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -252,6 +253,25 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
         logs.append(msg)
         _rest_jobs[job_id]["log"] = "\n".join(logs)
 
+    # Where the run is, as data rather than prose: the phase, how far through it,
+    # and when it began. The fleet turns this into a progress bar and a time
+    # estimate — a log line says what is happening, never how much is left.
+    # done/total are None for the phases with nothing to count (download, push).
+    def progress(phase: str, done: int | None = None, total: int | None = None) -> None:
+        prev = _rest_jobs[job_id].get("progress") or {}
+        started = prev.get("started") if prev.get("phase") == phase else time.time()
+        _rest_jobs[job_id]["progress"] = {"phase": phase, "done": done,
+                                          "total": total, "started": started}
+
+    _phase_label = {"check": "Recording check", "slam": "SLAM"}
+
+    def on_progress(done: int, total: int, phase: str) -> None:
+        progress(phase, done, total or None)
+        # One count line per finished episode, so the log alone says how far a
+        # run got. 0/N is the phase starting — its own heading covers that.
+        if total and done and phase in _phase_label:
+            log(f"[{_phase_label[phase]} {done}/{total}]")
+
     def flagged() -> list[str]:
         """The episodes whose SLAM outcome is not clean: a BAD/FAIL trajectory
         (what "the take lost tracking" looks like here), a SLAM failure, or a
@@ -272,6 +292,7 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
         # scopes it under a lock itself (see push_lerobot). Setting it globally
         # would let concurrent conversions clobber each other's token.
         api = HfApi(token=token)
+        progress("download")
         log(f"Downloading {source_repo}…")
         work = Path(tempfile.mkdtemp())
         raw = snapshot_download(source_repo, repo_type="dataset",
@@ -293,7 +314,8 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
             # Pre-check: record quality data for all episodes; exclude those with
             # recording errors unconditionally, and optionally exclude those with
             # recording warnings or poor sync depending on caller flags.
-            checks = precheck_episodes(episodes, log=log, run_sync=run_sync)
+            checks = precheck_episodes(episodes, log=log, run_sync=run_sync,
+                                       on_progress=on_progress)
             for c in checks:
                 sync = c.get("sync") or {}
                 sync_verdict = sync.get("verdict", "GOOD")
@@ -318,7 +340,8 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                 log("⚠ All episodes failed the recording check — nothing to process.")
             else:
                 # SLAM: convert + trajectory per episode.
-                slam_results = run_slam(slam_input, log=log, run_sync=run_sync)
+                slam_results = run_slam(slam_input, log=log, run_sync=run_sync,
+                                        on_progress=on_progress)
                 slam_succeeded = {ep for ep, _ in slam_results}
 
                 # Record SLAM failures (no trajectory produced at all).
@@ -381,12 +404,14 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                     # inferred from the layout, so a legacy flat upload keeps the
                     # original single-arm schema.
                     report_by_ep = {ep: rep for ep, rep in slam_results}
+                    progress("build")
                     built = build_recordings(target_repo, task, ds_root, kept,
                                              report_by_ep, roles=roles, log=log)
                     n_built = len(built)
                     n, link, _mode = push_lerobot(target_repo, task, ds_root,
                                                   n_built, token=token, log=log,
-                                                  private=private)
+                                                  private=private,
+                                                  on_progress=on_progress)
                     result_link = link or f"https://huggingface.co/datasets/{target_repo}"
                     log(f"✅ Done — {n} episode(s).")
 
@@ -439,6 +464,7 @@ async def api_process(req: _ProcessReq, authorization: str | None = Header(defau
                   or name.startswith(SLAM_CHECK_PREFIX))
     _rest_jobs[job_id] = {"status": "running", "log": "", "error": None, "result": None,
                           "quality": None, "flagged": None, "visualizer": None,
+                          "progress": None,
                           # What /api/quality looks up: the caller behind the device
                           # knows the repo it asked for, never this job's id.
                           "target_repo": target_repo, "check_only": check_only}
@@ -461,6 +487,15 @@ async def api_status(job_id: str):
     if job is None:
         return {"status": "not_found"}
     return job
+
+
+def _progress_view(p: dict | None) -> dict | None:
+    """The job's progress with the phase's age instead of its start time: the
+    caller's clock is not this Space's, so an epoch would skew every estimate."""
+    if not p:
+        return None
+    return {"phase": p.get("phase"), "done": p.get("done"), "total": p.get("total"),
+            "elapsed_s": round(time.time() - (p.get("started") or time.time()), 1)}
 
 
 @fastapi_app.get("/api/quality/{repo_id:path}")
@@ -489,6 +524,7 @@ async def api_quality(repo_id: str):
             "flagged": match.get("flagged"),
             "result": match.get("result"), "visualizer": match.get("visualizer"),
             "error": match.get("error"),
+            "progress": _progress_view(match.get("progress")),
             # Last log line only: enough to show what the run is doing without
             # shipping the whole (long) log on every poll.
             "log_tail": log.rstrip().split("\n")[-1] if log.strip() else ""}

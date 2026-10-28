@@ -330,8 +330,12 @@ CSS = """
 /* Deployment banner: which Space this is and what was deployed to it. Full-width
    above the title — it has to be read before a run is started, not found
    afterwards. Purple on a translucent wash so it reads on both the light and the
-   dark Gradio theme; the text itself keeps the theme's own colour. */
-#env-banner {border-radius: 10px; padding: .5rem .8rem; margin: 0 0 8px;
+   dark Gradio theme; the text itself keeps the theme's own colour.
+   width:0 + min-width:100%: it fills the page but never sets its width. The
+   container shrinks to its widest content, so a long branch name widened the
+   whole page and the (empty, idle) right column took the extra space. */
+#env-banner {width: 0; min-width: 100%; box-sizing: border-box;
+             border-radius: 10px; padding: .5rem .8rem; margin: 0 0 8px;
              font-size: .85rem; font-weight: 600; line-height: 1.45;
              background: rgba(139,92,246,.16); border: 1px solid rgba(139,92,246,.55);
              color: var(--body-text-color); text-align: center;}
