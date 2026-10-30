@@ -16,10 +16,11 @@ file instead of ~600 PNGs, ~2× smaller, and bit-identical once decoded, so the
 SLAM input is unchanged. Older recordings with a dcam_depth/ PNG directory are
 still accepted.
 
-Frame matching: left timestamps and depth timestamps share a seq number
-(both come from the same StereoDepth node). We take seqs present in both,
-in seq order, and assign consecutive idx = 0..N-1. mp4 frames are decoded
-in encoding order (= seq order); we trim to whichever stream is shortest.
+Frame matching uses bounded, one-to-one nearest capture timestamps on the
+common host_ms timeline. Sequence counters need not share an origin across
+streams. Every selected pair retains its original decoded picture indices;
+rejecting an unmatched frame cannot shift later image/timestamp associations.
+slam_input/frame_pairing.json records the matches and rejected left frames.
 
 Timestamps in the output CSVs are in nanoseconds. Camera frames keep their
 host_ms stamps — the clock the SLAM trajectory (and the downstream Arducam
@@ -30,6 +31,7 @@ through the *frame* stream removes the ~tens-of-ms false camera-IMU offset that
 using the IMU stream's own (differently-buffered over USB) host_ms injects.
 """
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -37,6 +39,9 @@ import tempfile
 from pathlib import Path
 
 from grabette_postprocess.episode_files import resolve
+from grabette_postprocess.timestamp_pairing import (
+    DEFAULT_PAIR_TOLERANCE_MS, pair_left_depth,
+)
 
 import numpy as np
 
@@ -95,6 +100,9 @@ def _run_ffmpeg(cmd: list[str], what: str) -> None:
 # after -i cuts the encoder pool, before -i does not.
 _FFMPEG_PNG_THREADS = ["-threads", "1"]
 
+# Both extractors use legacy -vsync 0 for picture passthrough: the SLAM Docker
+# image's Ubuntu 22.04 FFmpeg 4.4 does not yet support -fps_mode passthrough.
+
 
 def _extract_mp4_frames(mp4_path: Path, out_dir: Path) -> int:
     """Decode mp4 to GRAY8 6-digit PNGs starting at 000000.png. Returns count."""
@@ -103,6 +111,7 @@ def _extract_mp4_frames(mp4_path: Path, out_dir: Path) -> int:
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(mp4_path),
         *_FFMPEG_PNG_THREADS,
+        "-vsync", "0",
         "-pix_fmt", "gray",
         "-start_number", "0",
         str(out_dir / "%06d.png"),
@@ -122,6 +131,7 @@ def _extract_depth_video(mkv_path: Path, out_dir: Path) -> int:
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(mkv_path),
         *_FFMPEG_PNG_THREADS,
+        "-vsync", "0",
         "-start_number", "0",
         str(out_dir / "%06d.png"),
     ]
@@ -171,18 +181,71 @@ def _split_imu_to_csvs(imu_json: Path, slam_dir: Path,
     return n_acc, n_gyr, n_rot
 
 
-def convert_episode(ep_dir: Path, force: bool = False) -> Path:
-    slam_dir = ep_dir / "slam_input"
-    if slam_dir.exists() and not force:
-        print(f"  slam_input/ already exists at {slam_dir} (use --force to overwrite)")
-        return slam_dir
-    if force and slam_dir.exists():
-        shutil.rmtree(slam_dir)
+def _source_signature(ep_dir: Path, paths: list[Path]) -> dict:
+    """Fingerprint sidecar contents and media metadata for derived-cache reuse.
 
-    # --- Required inputs ---
-    # Depth comes either as a compact lossless video (dcam_depth.mkv, the format
-    # the uploader now produces) or, for older recordings, a directory of
-    # per-frame PNGs (dcam_depth/). Either is accepted.
+    Hash JSON sidecars; media uses size/mtime so a cached conversion does not
+    reread an entire recording or legacy depth PNG sequence.
+    """
+    signature = {}
+    for path in paths:
+        stat = path.stat()
+        entry = {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        if path.suffix == ".json":
+            with path.open("rb") as stream:
+                entry["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        signature[str(path.relative_to(ep_dir))] = entry
+    return signature
+
+
+def _cached_conversion_complete(slam_dir: Path, cached: dict, signature: dict,
+                                max_pair_delta_ms: float) -> bool:
+    if not (cached.get("schema_version") == 1 and cached.get("complete") is True
+            and cached.get("method") == "common_host_ms_bounded_nearest_one_to_one"
+            and cached.get("max_delta_ms") == max_pair_delta_ms
+            and cached.get("source_signature") == signature):
+        return False
+    count = cached.get("matched_count")
+    if (type(count) is not int or count <= 0 or not isinstance(cached.get("pairs"), list)
+            or len(cached["pairs"]) != count):
+        return False
+    required = [slam_dir / "timestamps.csv", slam_dir / "calib_offline.json"]
+    names = {f"{index:06d}.png" for index in range(count)}
+    for name in ("frames", "depth"):
+        if {path.name for path in (slam_dir / name).glob("*.png")} != names:
+            return False
+        required.extend(slam_dir / name / filename for filename in names)
+    if any(not path.is_file() or path.stat().st_size == 0 for path in required):
+        return False
+    if cached.get("imu_present"):
+        if any(not (slam_dir / name).is_file() for name in
+               ("imu_acc.csv", "imu_gyro.csv", "imu_rotation.csv")):
+            return False
+    return True
+
+
+def convert_episode(ep_dir: Path, force: bool = False,
+                    max_pair_delta_ms: float = DEFAULT_PAIR_TOLERANCE_MS) -> Path:
+    """Build RGB-D inputs without assuming cross-stream seq equality.
+
+    Existing derived data from the old seq join must be explicitly rebuilt
+    with force=True. A completion manifest prevents reusing a partial failure.
+    """
+    ep_dir = Path(ep_dir)
+    slam_dir = ep_dir / "slam_input"
+    cached = {}
+    if slam_dir.exists() and not force:
+        try:
+            cached = json.loads((slam_dir / "frame_pairing.json").read_text())
+        except (OSError, ValueError):
+            pass
+        if not (isinstance(cached, dict) and cached.get("complete") is True
+                and cached.get("method") == "common_host_ms_bounded_nearest_one_to_one"):
+            raise RuntimeError(
+                f"Existing {slam_dir} has no complete timestamp-pairing conversion. "
+                "Rebuild with --force; raw inputs are preserved."
+            )
+
     left_mp4 = resolve(ep_dir, "dcam_left.mp4")
     depth_dir = resolve(ep_dir, "dcam_depth")
     depth_mkv = resolve(ep_dir, "dcam_depth.mkv")
@@ -190,95 +253,104 @@ def convert_episode(ep_dir: Path, force: bool = False) -> Path:
     depth_ts_json = resolve(ep_dir, "dcam_depth_timestamps.json")
     imu_json = resolve(ep_dir, "dcam_imu.json")
     calib_src = resolve(ep_dir, "dcam_calib_offline.json")
-    # dcam_imu.json is deliberately NOT in this list: the Orbbec Gemini 305 has
-    # no IMU, so an episode from it has no IMU JSON at all. offline_vslam handles
-    # the absent CSVs (its IMU block is guarded on non-empty buffers), and the
-    # Phase 0 ablation showed IMU-free odometry is indistinguishable from
-    # re-running the pipeline. Treating it as required would reject every 305
-    # episode before SLAM ever runs.
-    for p in (left_mp4, left_ts_json, depth_ts_json, calib_src):
-        if not p.exists():
-            raise FileNotFoundError(f"Missing required input: {p}")
+    # IMU is optional: Orbbec recordings intentionally have no IMU JSON.
+    for path in (left_mp4, left_ts_json, depth_ts_json, calib_src):
+        if not path.exists():
+            raise FileNotFoundError(f"Missing required input: {path}")
     if not depth_mkv.is_file() and not depth_dir.is_dir():
-        raise FileNotFoundError(
-            f"Missing depth: neither {depth_mkv} nor {depth_dir}")
+        raise FileNotFoundError(f"Missing depth: neither {depth_mkv} nor {depth_dir}")
 
+    left_ts = json.loads(left_ts_json.read_text())["samples"]
+    depth_ts = json.loads(depth_ts_json.read_text())["samples"]
+    pairing = pair_left_depth(left_ts, depth_ts, max_pair_delta_ms)
+    matched = pairing["pairs"]
+    if not matched:
+        raise ValueError("No left/depth pairs within common coverage and timestamp tolerance")
+    sources = [left_mp4, left_ts_json, depth_ts_json, calib_src]
+    if imu_json.is_file():
+        sources.append(imu_json)
+    if depth_mkv.is_file():
+        sources.append(depth_mkv)
+    else:
+        sources.extend(depth_dir / f'{int(row["seq"]):08d}.png' for row in depth_ts)
+    signature = _source_signature(ep_dir, sources)
+    if slam_dir.exists() and not force:
+        if _cached_conversion_complete(slam_dir, cached, signature, max_pair_delta_ms):
+            print(f"  slam_input/ already exists at {slam_dir} (use --force to overwrite)")
+            return slam_dir
+        raise RuntimeError(
+            f"Existing {slam_dir} has no complete timestamp-pairing conversion "
+            "for the current inputs and tolerance. Rebuild with --force; raw inputs are preserved."
+        )
+    dev_to_host_s = fit_device_to_host_s(left_ts)
+    if force and slam_dir.exists():
+        shutil.rmtree(slam_dir)
     slam_dir.mkdir(parents=True)
     (slam_dir / "frames").mkdir()
     (slam_dir / "depth").mkdir()
 
-    # --- Calib (already in expected schema) ---
-    shutil.copyfile(calib_src, slam_dir / "calib_offline.json")
+    # This directory is created by this invocation; failed derived output must
+    # not be accepted as a cached conversion on the next invocation.
+    try:
+        shutil.copyfile(calib_src, slam_dir / "calib_offline.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_frames = Path(tmp) / "frames"
+            n_mp4 = _extract_mp4_frames(left_mp4, tmp_frames)
+            if n_mp4 != len(left_ts):
+                raise ValueError(
+                    f"Left decoded picture/timestamp count mismatch: {n_mp4} != {len(left_ts)}"
+                )
 
-    # --- Build (seq, host_ms) pairs that exist in BOTH left and depth ---
-    left_ts = json.loads(left_ts_json.read_text())["samples"]
-    depth_ts = json.loads(depth_ts_json.read_text())["samples"]
-    # device→host fit from the frame stream: lets the IMU below ride the same
-    # host timeline as the frames (removes the false camera-IMU offset).
-    dev_to_host_s = fit_device_to_host_s(left_ts)
-    depth_seqs = {int(d["seq"]): d for d in depth_ts}
-    matched = [
-        (int(l["seq"]), float(l["host_ms"]))
-        for l in left_ts if int(l["seq"]) in depth_seqs
-    ]
-    matched.sort(key=lambda x: x[0])  # ascending seq
+            # Index is the original encoded-picture index, not the position
+            # after timestamp filtering. This prevents a rejected first or
+            # interior left picture from shifting all later image/time pairs.
+            for index, pair in enumerate(matched):
+                source = tmp_frames / f'{pair["left_frame_index"]:06d}.png'
+                shutil.move(str(source), str(slam_dir / "frames" / f"{index:06d}.png"))
 
-    # --- Extract mp4 frames ---
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_frames = Path(tmp) / "frames"
-        n_mp4 = _extract_mp4_frames(left_mp4, tmp_frames)
+            if depth_mkv.is_file():
+                tmp_depth = Path(tmp) / "depth"
+                n_depth = _extract_depth_video(depth_mkv, tmp_depth)
+                if n_depth != len(depth_ts):
+                    raise ValueError(
+                        f"Depth decoded picture/timestamp count mismatch: {n_depth} != {len(depth_ts)}"
+                    )
+                depth_sources = [tmp_depth / f"{i:06d}.png" for i in range(len(depth_ts))]
+            else:
+                depth_sources = [depth_dir / f'{int(row["seq"]):08d}.png' for row in depth_ts]
 
-        # Trim to min of (matched pairs, decoded mp4 frames)
-        n = min(len(matched), n_mp4)
-        if n < len(matched):
-            print(f"  WARNING: trimming {len(matched)-n} pairs (mp4 has {n_mp4} frames)")
-        if n < n_mp4:
-            print(f"  WARNING: ignoring {n_mp4-n} extra mp4 frames (no matching depth)")
+            for index, pair in enumerate(matched):
+                source = depth_sources[pair["depth_frame_index"]]
+                if not source.is_file():
+                    raise FileNotFoundError(
+                        f'Depth source picture missing for seq {pair["depth_seq"]}: {source}'
+                    )
+                shutil.copyfile(source, slam_dir / "depth" / f"{index:06d}.png")
 
-        # Move to slam_input/frames/<idx>.png. shutil.move() (not Path.rename()) so
-        # it works when tmp_frames is on tmpfs and slam_dir is on disk —
-        # rename() raises EXDEV across filesystems.
-        for idx in range(n):
-            shutil.move(str(tmp_frames / f"{idx:06d}.png"),
-                        str(slam_dir / "frames" / f"{idx:06d}.png"))
+            with (slam_dir / "timestamps.csv").open("w") as stream:
+                stream.write("idx,timestamp_ns\n")
+                for index, pair in enumerate(matched):
+                    stream.write(f'{index},{_ms_to_ns(pair["left_host_ms"])}\n')
 
-        # Resolve each depth seq to a source PNG. For the video format, decode
-        # it once to temp PNGs; frame i ↔ depth_ts[i].seq (encode order). For
-        # the legacy dir format, the PNG is named by seq.
-        if depth_mkv.is_file():
-            tmp_depth = Path(tmp) / "depth"
-            _extract_depth_video(depth_mkv, tmp_depth)
-            seq_to_png = {
-                int(s["seq"]): tmp_depth / f"{i:06d}.png"
-                for i, s in enumerate(depth_ts)
-            }
+        n = len(matched)
+        if imu_json.exists():
+            n_acc, n_gyr, n_rot = _split_imu_to_csvs(imu_json, slam_dir, dev_to_host_s)
+            clock = "device→host fit" if dev_to_host_s is not None else "raw host_ms (no device_us)"
+            print(f"  slam_input/ written: {n} frames, {n_acc} accel, {n_gyr} gyro, "
+                  f"{n_rot} rotation samples (IMU clock: {clock})")
         else:
-            seq_to_png = {
-                int(s["seq"]): depth_dir / f'{int(s["seq"]):08d}.png'
-                for s in depth_ts
-            }
-
-        # Copy matched depth frames → slam_input/depth/<idx>.png
-        for idx, (seq, _) in enumerate(matched[:n]):
-            depth_png = seq_to_png.get(seq)
-            if depth_png is None or not depth_png.exists():
-                raise FileNotFoundError(f"depth frame missing for seq {seq}")
-            shutil.copyfile(depth_png, slam_dir / "depth" / f"{idx:06d}.png")
-
-        # --- Write timestamps.csv (idx, ns) ---
-        with (slam_dir / "timestamps.csv").open("w") as f:
-            f.write("idx,timestamp_ns\n")
-            for idx, (_, host_ms) in enumerate(matched[:n]):
-                f.write(f"{idx},{_ms_to_ns(host_ms)}\n")
-
-    # --- Split IMU JSON → imu_acc.csv + imu_gyro.csv + imu_rotation.csv ---
-    # Skipped entirely for an IMU-less camera; offline_vslam then takes its
-    # no-orientation path and RTAB-Map runs plain RGB-D odometry.
-    if imu_json.exists():
-        n_acc, n_gyr, n_rot = _split_imu_to_csvs(imu_json, slam_dir, dev_to_host_s)
-        clk = "device→host fit" if dev_to_host_s is not None else "raw host_ms (no device_us)"
-        print(f"  slam_input/ written: {n} frames, {n_acc} accel, {n_gyr} gyro, "
-              f"{n_rot} rotation samples (IMU clock: {clk})")
-    else:
-        print(f"  slam_input/ written: {n} frames, no IMU (IMU-less camera)")
+            print(f"  slam_input/ written: {n} frames, no IMU (IMU-less camera)")
+        if _source_signature(ep_dir, sources) != signature:
+            raise RuntimeError("Recording inputs changed during conversion; retry with stable inputs")
+        pairing["complete"] = True
+        pairing["source_signature"] = signature
+        pairing["imu_present"] = imu_json.is_file()
+        pairing["left_decoded_picture_count"] = n_mp4
+        pairing["depth_decoded_picture_count"] = len(depth_ts) if depth_mkv.is_file() else None
+        (slam_dir / "frame_pairing.json").write_text(json.dumps(pairing, indent=2))
+        print(f'  timestamp pairing: {n} pairs, {pairing["rejected_left_count"]} rejected left frames, '
+              f'max residual {pairing["max_absolute_residual_ms"]:.3f} ms')
+    except BaseException:
+        shutil.rmtree(slam_dir)
+        raise
     return slam_dir

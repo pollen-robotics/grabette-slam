@@ -166,7 +166,7 @@ def build_dataset(
         repo_id: dataset identifier (e.g. "<user>/<dataset>")
         episode_dirs: list of episode directory paths
         task: task description string
-        fps: dataset frame rate (default: 50fps, the native Arducam rate)
+        fps: dataset frame rate (default: 30fps)
         image_size: (height, width) for Arducam output frames
         root: local storage path (default: HF cache)
         source_user: if set, write a `meta/episode_sources.json` traceability

@@ -116,6 +116,31 @@ The recording (grabette's `hardware/orbbec.py` or `hardware/oakd.py`) stores com
 `imu_rotation.csv`, `calib_offline.json`) consumed by the C++ `offline_vslam`
 binary.
 
+Left/depth pictures are paired by their common capture-time `host_ms`, not by
+equal sequence counters. The converter chooses the nearest unused depth picture
+in order, within 16.667 ms by default (half a 30 Hz frame interval). Exact ties
+choose the earlier depth picture. This is a bounded matching policy, not a claim
+that the sensors exposed simultaneously or a maximum-cardinality matching.
+Left pictures outside the depth timeline's coverage are rejected, including
+small endpoint skews. Hardware-synced Orbbec pairs with equal capture times are
+retained unchanged. Set a different tolerance when needed:
+
+```bash
+uv run python scripts/pipeline/convert_episode_for_slam.py -i ~/data/episode \
+    --max-pair-delta-ms 10
+```
+
+`slam_input/frame_pairing.json` records source picture indices, selected
+timestamps, residuals and rejected left pictures. Each decoded video must have
+exactly as many pictures as its own timestamp sidecar; mismatches fail instead
+of silently trimming and shifting associations. Source recordings are unchanged.
+Existing conversions made with sequence matching, partial output, changed
+inputs or a different tolerance require an explicit `--force` rebuild. Cache
+reuse checks sidecar content hashes, media size/mtime and expected output files;
+use `--force` after deliberately replacing media while preserving its metadata.
+Convert each episode from only one process at a time; concurrent conversions
+of the same episode are not supported.
+
 `run_slam.py` then runs RTAB-Map odometry in Docker, integrates the
 frame-to-frame deltas into absolute poses, rotates the world frame to Z-up
 (x forward, y left, z up) and writes `camera_trajectory.csv`. With an IMU the

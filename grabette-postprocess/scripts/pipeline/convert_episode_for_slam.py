@@ -17,6 +17,7 @@ from pathlib import Path
 import click
 
 from grabette_postprocess.convert import convert_episode
+from grabette_postprocess.timestamp_pairing import DEFAULT_PAIR_TOLERANCE_MS
 
 
 @click.command()
@@ -24,13 +25,16 @@ from grabette_postprocess.convert import convert_episode
               type=click.Path(exists=True),
               help="Episode directory (repeatable for batch)")
 @click.option("--force", is_flag=True, help="Overwrite existing slam_input/ subdir")
-def main(input_dir, force):
+@click.option("--max-pair-delta-ms", default=DEFAULT_PAIR_TOLERANCE_MS,
+              type=click.FloatRange(min=0), show_default=True,
+              help="Maximum left/depth capture-time distance in milliseconds")
+def main(input_dir, force, max_pair_delta_ms):
     """Convert episode directories to the slam_input/ layout for SLAM."""
     for d in input_dir:
         ep_dir = Path(d).expanduser().absolute()
         print(f"Converting {ep_dir.name}...")
         try:
-            convert_episode(ep_dir, force=force)
+            convert_episode(ep_dir, force=force, max_pair_delta_ms=max_pair_delta_ms)
         except Exception as e:
             print(f"  FAILED: {e}", file=sys.stderr)
 
