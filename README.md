@@ -24,7 +24,9 @@ A HuggingFace Space that turns a raw Grabette recording dataset into a
    - `convert_episode` — expand the recording into the `slam_input/` layout
    - `run_slam` — RGB-D odometry (visual-inertial when the camera has an IMU) via
      the bundled `offline_vslam` binary
-   - `build_dataset` — assemble a LeRobot v3 dataset
+   - `build_dataset` — assemble a LeRobot v3 dataset (RGB cameras, depth map,
+     8D action per arm; see
+     [grabette-postprocess/README.md](grabette-postprocess/README.md#dataset-features))
    - `push_to_hub` — upload under your account
 4. A link + embedded view of the
    [LeRobot visualizer](https://huggingface.co/spaces/lerobot/visualize_dataset)
