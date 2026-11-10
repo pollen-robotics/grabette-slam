@@ -24,7 +24,10 @@ from grabette_postprocess.checks.tags import episode_tags
 @click.option("--image_width", type=int, default=960)
 @click.option("--root", type=click.Path(), default=None,
               help="Local storage path (default: HF cache)")
-def main(input_dir, repo_id, task, fps, image_height, image_width, root):
+@click.option("--depth/--no-depth", default=True, show_default=True,
+              help="Include the depth map (observation.images.cam1_depth, 12-bit "
+                   "log-quantized HEVC; see dataset.DEPTH_QUANTIZATION)")
+def main(input_dir, repo_id, task, fps, image_height, image_width, root, depth):
     input_dir = Path(input_dir).expanduser().absolute()
 
     # Episode dirs that already carry a trajectory CSV (SLAM has run) and the
@@ -54,6 +57,7 @@ def main(input_dir, repo_id, task, fps, image_height, image_width, root):
         image_size=(image_height, image_width),
         root=Path(root) if root else None,
         tags_by_recording=tags_by_recording,
+        with_depth=depth,
     )
 
 

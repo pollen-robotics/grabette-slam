@@ -3,6 +3,9 @@
 Converts trajectory + capture data into LeRobot v3 format (Parquet + MP4).
 Two camera observations: cam0 (RPi fisheye, raw_video.mp4) and cam1 (depth camera
 left, dcam_left.mp4), both selected nearest-by-timestamp against the trajectory.
+Plus, unless disabled, cam1_depth: the depth map (dcam_depth.mkv, uint16 mm),
+pixel-registered to cam1's sensor, stored as a LeRobot depth stream (see
+DEPTH_QUANTIZATION).
 """
 
 import json
@@ -52,6 +55,50 @@ FEATURES_BASE = {
         "names": ["is_lost"],
     },
 }
+
+# --- Depth ---------------------------------------------------------------------
+# Depth maps go into the dataset as LeRobot depth streams: each uint16-mm frame is
+# quantized to 12-bit codes and encoded as lossless HEVC (gray12le) in an MP4, then
+# dequantized back to mm/m on load. The 12 bits are spread over
+# [depth_min, depth_max] (metres), so the range is tuned for grabette's close-range
+# view rather than LeRobot's generic 0.01–10 m:
+#   - log scale with a near-zero shift = pure log → constant RELATIVE precision
+#     (~0.09 % per code), i.e. sub-mm where it matters (gripper/object at 0.1–1 m).
+#     Measured on Gemini 305 episodes: 0.00 mm mean round-trip error below 1 m,
+#     0.26 mm at 1–2 m, 0.6 mm at 2–3 m (vs 0.2–0.45 mm everywhere with the
+#     LeRobot defaults).
+#   - depth_max = 3 m covers the 95th percentile of every recorded episode; farther
+#     background saturates at 3 m.
+#   - depth_min = 7 cm sits just below the sensor's ~9 cm floor, so no valid pixel
+#     lands on code 0: code 0 ⇔ invalid (raw 0). On load, a pixel whose decoded
+#     depth is <= depth_min is an invalid pixel, not a close obstacle.
+#   - shift is 1 mm rather than 0 only so invalid zeros don't hit log(0).
+# The values are persisted in meta/info.json (video.depth_min/…), so loaders
+# dequantize correctly whatever is chosen here.
+DEPTH_QUANTIZATION = {
+    "depth_min": 0.07,
+    "depth_max": 3.0,
+    "shift": 0.001,
+    "use_log": True,
+}
+# Native depth resolution of both supported depth cameras (OAK-D SR default and
+# Orbbec Gemini 305). Kept native — resizing depth would interpolate across edges.
+DEPTH_SIZE = (400, 640)  # (H, W)
+
+
+def _depth_feature(size: tuple[int, int]) -> dict:
+    h, w = size
+    return {
+        "dtype": "video",
+        "shape": (1, h, w),
+        "names": ["channels", "height", "width"],
+        "info": {"is_depth_map": True},
+    }
+
+
+def _depth_encoder():
+    from lerobot.configs import DepthEncoderConfig
+    return DepthEncoderConfig(**DEPTH_QUANTIZATION)
 
 
 def _load_video_frames_indexed(video_path: Path, size: tuple[int, int],
@@ -111,6 +158,71 @@ def _load_dcam_left_timestamps(episode_dir: Path) -> np.ndarray | None:
     return np.array([s["host_ms"] for s in samples], dtype=np.float64) / 1000.0
 
 
+def _load_depth_samples(episode_dir: Path) -> list[dict] | None:
+    """dcam_depth_timestamps.json samples (seq + host_ms), in depth-frame order.
+    None when the episode has no depth (no timestamps, or neither dcam_depth.mkv
+    nor a dcam_depth/ PNG directory)."""
+    ts_path = resolve(episode_dir, "dcam_depth_timestamps.json")
+    if not ts_path.is_file():
+        return None
+    if not (resolve(episode_dir, "dcam_depth.mkv").is_file()
+            or resolve(episode_dir, "dcam_depth").is_dir()):
+        return None
+    with open(ts_path) as f:
+        samples = json.load(f).get("samples", [])
+    return samples or None
+
+
+def _depth_timestamps(samples: list[dict]) -> np.ndarray:
+    """host_ms (seconds) per depth frame — the same clock as dcam_left / the SLAM
+    trajectory (both come from the same StereoDepth node / sensor)."""
+    return np.array([s["host_ms"] for s in samples], dtype=np.float64) / 1000.0
+
+
+def _fit_depth(depth: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """(H, W) uint16 → (H, W, 1) at `size`. Nearest-neighbour only: any other
+    interpolation would invent depths between foreground and background."""
+    h, w = size
+    if depth.shape != (h, w):
+        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+    return depth[..., None]
+
+
+def _load_depth_frames_indexed(episode_dir: Path, samples: list[dict],
+                               size: tuple[int, int],
+                               needed_indices: set[int]) -> dict[int, np.ndarray]:
+    """Load only the depth frames at the given indices (index i ↔ samples[i]).
+
+    Returns dict mapping frame_index -> (H, W, 1) uint16 depth in mm. Reads the
+    lossless FFV1 dcam_depth.mkv (frame i is samples[i], encode order — see
+    convert._extract_depth_video), or, for older recordings, the dcam_depth/
+    directory of per-seq PNGs.
+    """
+    cache: dict[int, np.ndarray] = {}
+    if not needed_indices:
+        return cache
+    mkv = resolve(episode_dir, "dcam_depth.mkv")
+    if mkv.is_file():
+        max_idx = max(needed_indices)
+        with av.open(str(mkv)) as container:
+            stream = container.streams.video[0]
+            for i, frame in enumerate(container.decode(stream)):
+                if i in needed_indices:
+                    cache[i] = _fit_depth(frame.to_ndarray(format="gray16le"), size)
+                if i >= max_idx:
+                    break
+        return cache
+    depth_dir = resolve(episode_dir, "dcam_depth")
+    for i in needed_indices:
+        if i >= len(samples):
+            continue
+        png = depth_dir / f'{int(samples[i]["seq"]):08d}.png'
+        img = cv2.imread(str(png), cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            cache[i] = _fit_depth(img.astype(np.uint16, copy=False), size)
+    return cache
+
+
 def _nearest_frame_indices(query_ts: np.ndarray, frame_ts: np.ndarray) -> np.ndarray:
     """For each query timestamp, the index of the nearest frame timestamp.
 
@@ -154,6 +266,8 @@ def build_dataset(
     source_user: str | None = None,
     tags_by_recording: dict[str, list[str]] | None = None,
     recording_name_of=None,
+    with_depth: bool = True,
+    depth_size: tuple[int, int] = DEPTH_SIZE,
 ):
     """Build LeRobot v3 dataset from processed episode directories.
 
@@ -184,6 +298,10 @@ def build_dataset(
             dir name (flat layout). Pass e.g. `lambda d: d.parent.name` when the
             raw dataset is role-partitioned ({episode_id}/{role}), so episodes
             key by episode_id instead of the (colliding) role.
+        with_depth: add `observation.images.cam1_depth` (depth map registered
+            to cam1, uint16 mm, quantized per DEPTH_QUANTIZATION). Episodes
+            without depth are then skipped, since the schema must be uniform.
+        depth_size: (height, width) of the stored depth maps (native by default).
     """
     # Lazy import — lerobot is a heavy dependency
     from lerobot.configs import RGBEncoderConfig
@@ -206,6 +324,8 @@ def build_dataset(
         **features["observation.images.cam1"],
         "shape": (3, h, w),
     }
+    if with_depth:
+        features["observation.images.cam1_depth"] = _depth_feature(depth_size)
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
@@ -216,6 +336,7 @@ def build_dataset(
         use_videos=True,
         # h264 kept over the libsvtav1 default so the LeRobot web visualizer can play it
         rgb_encoder=RGBEncoderConfig(vcodec="h264"),
+        depth_encoder=_depth_encoder() if with_depth else None,
         # Encode frames straight to MP4 as they're added, instead of writing every
         # frame to disk as PNG and re-reading + re-encoding at save_episode(). The
         # PNG round-trip is the main cost of the "building dataset" step on CPU.
@@ -234,6 +355,10 @@ def build_dataset(
         traj_path = find_trajectory_csv(ep_dir)
         if traj_path is None:
             print("  Skipping: no trajectory CSV found")
+            continue
+        depth_samples = _load_depth_samples(ep_dir) if with_depth else None
+        if with_depth and depth_samples is None:
+            print("  Skipping: no depth (dcam_depth.mkv / dcam_depth/ + timestamps)")
             continue
 
         # Trajectory timestamps in seconds, relative to recording start (t=0),
@@ -261,23 +386,36 @@ def build_dataset(
         cam1_cache = _load_video_frames_indexed(dcam_path, image_size,
                                                 set(cam1_indices.tolist()))
 
+        # --- depth: own timestamps (same host clock), same nearest-ts selection ---
+        if with_depth:
+            depth_ts = _depth_timestamps(depth_samples)
+            print(f"  Depth: {len(depth_ts)} frames, {depth_ts[-1]:.2f}s")
+            depth_indices = _nearest_frame_indices(traj_ts, depth_ts)
+            depth_cache = _load_depth_frames_indexed(
+                ep_dir, depth_samples, depth_size, set(depth_indices.tolist()))
+
         for i in range(n_frames):
             img = cam0_cache.get(cam0_indices[i])
             dcam_img = cam1_cache.get(cam1_indices[i])
-            if img is None or dcam_img is None:
-                which = "RPi" if img is None else "depth-camera left"
+            depth = depth_cache.get(depth_indices[i]) if with_depth else None
+            if img is None or dcam_img is None or (with_depth and depth is None):
+                which = ("RPi" if img is None else
+                         "depth-camera left" if dcam_img is None else "depth")
                 print(f"  Warning: missing {which} frame at step {i}, t={traj_ts[i]:.3f}s")
                 break
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             dcam_rgb = cv2.cvtColor(dcam_img, cv2.COLOR_BGR2RGB)
 
-            dataset.add_frame({
+            frame = {
                 "task": task,
                 "observation.images.cam0": img_rgb,
                 "observation.images.cam1": dcam_rgb,
                 "action": actions[i],
                 "is_lost": np.array([is_lost[i]], dtype=np.float32),
-            })
+            }
+            if with_depth:
+                frame["observation.images.cam1_depth"] = depth  # uint16 mm
+            dataset.add_frame(frame)
 
         dataset.save_episode()
         saved_recordings.append(name_of(ep_dir))
@@ -312,11 +450,13 @@ def _load_capture_started(ep_dir: Path) -> float | None:
         return None
 
 
-def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int]) -> dict:
+def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int],
+                      with_depth: bool = False) -> dict:
     """Load one arm's SLAM trajectory + 8D actions + is_lost + per-video
-    timestamps (cam0 RPi fisheye, cam1 depth-camera left) for nearest-ts frame selection,
-    plus its capture_started clock. Raises if the trajectory or a video is
-    missing (a valid grabette arm always has all of them)."""
+    timestamps (cam0 RPi fisheye, cam1 depth-camera left, and the depth map when
+    with_depth) for nearest-ts frame selection, plus its capture_started clock.
+    Raises if the trajectory or a video is missing (a valid grabette arm always
+    has all of them — depth included, it is the SLAM input)."""
     ep_dir = Path(ep_dir).absolute()
     traj_path = find_trajectory_csv(ep_dir)
     if traj_path is None:
@@ -326,7 +466,12 @@ def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int]) -> dict:
     cam1_ts = _load_dcam_left_timestamps(ep_dir)
     if cam1_ts is None:
         raise ValueError(f"no depth-camera left timestamps in {ep_dir}")
+    depth_samples = _load_depth_samples(ep_dir) if with_depth else None
+    if with_depth and depth_samples is None:
+        raise ValueError(f"no depth (dcam_depth.mkv / dcam_depth/ + timestamps) in {ep_dir}")
     return {
+        "depth_samples": depth_samples,
+        "depth_ts": _depth_timestamps(depth_samples) if depth_samples else None,
         "dir": ep_dir,
         "traj_ts": traj_ts,
         "actions": _episode_actions(df, traj_ts, ep_dir),      # (N, 8)
@@ -349,6 +494,8 @@ def build_dataset_multi(
     root: Path | None = None,
     source_user: str | None = None,
     tags_by_recording: dict[str, list[str]] | None = None,
+    with_depth: bool = True,
+    depth_size: tuple[int, int] = DEPTH_SIZE,
 ):
     """Build a LeRobot v3 dataset with a uniform, role-prefixed schema for ONE OR
     MORE arms (roles). Mono is just the single-role case of this: a lone left
@@ -357,7 +504,8 @@ def build_dataset_multi(
     format, differing only in how many arms are present.
 
     Per role: observation.images.{role}_cam0 (RPi fisheye) + {role}_cam1 (depth
-    camera left); `action` is the per-role 8D absolute states concatenated (in `roles`
+    camera left), plus {role}_cam1_depth when with_depth (see build_dataset);
+    `action` is the per-role 8D absolute states concatenated (in `roles`
     order); `is_lost` is per-role.
 
     groups: {episode_id: {role: arm_episode_dir}} — one entry per synchronized
@@ -380,7 +528,9 @@ def build_dataset_multi(
                 "dtype": "video", "shape": (3, h, w),
                 "names": ["channels", "height", "width"],
             }
-    per = ["x", "y", "z", "ax", "ay", "az", "proximal", "distal"]
+        if with_depth:
+            features[f"observation.images.{role}_cam1_depth"] = _depth_feature(depth_size)
+    per =["x", "y", "z", "ax", "ay", "az", "proximal", "distal"]
     features["action"] = {
         "dtype": "float32", "shape": (8 * len(roles),),
         "names": [f"{r}_{n}" for r in roles for n in per],
@@ -394,6 +544,7 @@ def build_dataset_multi(
         repo_id=repo_id, fps=int(fps), features=features, root=root,
         robot_type="grabette", use_videos=True,
         rgb_encoder=RGBEncoderConfig(vcodec="h264"),
+        depth_encoder=_depth_encoder() if with_depth else None,
         streaming_encoding=True,
     )
 
@@ -406,7 +557,7 @@ def build_dataset_multi(
             print(f"  Skipping {ep_id}: missing arm(s) {missing}")
             continue
         print(f"\nProcessing {ep_id} ({'+'.join(roles)})...")
-        arms = {r: _load_arm_streams(group[r], image_size) for r in roles}
+        arms = {r: _load_arm_streams(group[r], image_size, with_depth) for r in roles}
         ref = arms[ref_role]
         full_ref_ts = ref["traj_ts"]
 
@@ -445,10 +596,13 @@ def build_dataset_multi(
             traj_idx = _nearest_frame_indices(q, a["traj_ts"])
             cam0_idx = _nearest_frame_indices(q, a["cam0_ts"])
             cam1_idx = _nearest_frame_indices(q, a["cam1_ts"])
-            idxs[r] = (traj_idx, cam0_idx, cam1_idx)
+            depth_idx = _nearest_frame_indices(q, a["depth_ts"]) if with_depth else None
+            idxs[r] = (traj_idx, cam0_idx, cam1_idx, depth_idx)
             caches[r] = (
                 _load_video_frames_indexed(a["cam0_path"], image_size, set(cam0_idx.tolist())),
                 _load_video_frames_indexed(a["cam1_path"], image_size, set(cam1_idx.tolist())),
+                _load_depth_frames_indexed(a["dir"], a["depth_samples"], depth_size,
+                                           set(depth_idx.tolist())) if with_depth else {},
             )
 
         wrote = 0
@@ -457,15 +611,18 @@ def build_dataset_multi(
             act_parts, lost_parts = [], []
             ok = True
             for r in roles:
-                traj_idx, cam0_idx, cam1_idx = idxs[r]
-                cam0_cache, cam1_cache = caches[r]
+                traj_idx, cam0_idx, cam1_idx, depth_idx = idxs[r]
+                cam0_cache, cam1_cache, depth_cache = caches[r]
                 im0 = cam0_cache.get(cam0_idx[i])
                 im1 = cam1_cache.get(cam1_idx[i])
-                if im0 is None or im1 is None:
+                depth = depth_cache.get(depth_idx[i]) if with_depth else None
+                if im0 is None or im1 is None or (with_depth and depth is None):
                     ok = False
                     break
                 frame[f"observation.images.{r}_cam0"] = cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
                 frame[f"observation.images.{r}_cam1"] = cv2.cvtColor(im1, cv2.COLOR_BGR2RGB)
+                if with_depth:
+                    frame[f"observation.images.{r}_cam1_depth"] = depth  # uint16 mm
                 ti = traj_idx[i]
                 act_parts.append(arms[r]["actions"][ti])
                 lost_parts.append(arms[r]["is_lost"][ti])
