@@ -66,7 +66,10 @@ def test_build_dataset_roundtrip(tmp_path):
 
     feats = ds.meta.features
     assert feats["observation.images.cam0"]["dtype"] == "video"
-    assert feats["observation.images.cam1"]["dtype"] == "video"
+    assert feats["observation.images.cam1_left"]["dtype"] == "video"
+    # an episode without right image / IMU → neither in the schema
+    assert "observation.images.cam1_right" not in feats
+    assert "imu" not in feats
     assert tuple(feats["action"]["shape"]) == (8,)
     assert "is_lost" in feats
     assert ds.meta.depth_keys == []
@@ -80,6 +83,8 @@ def test_build_dataset_roundtrip(tmp_path):
     action = np.asarray(sample["action"]).ravel()
     assert action.shape == (8,)
     np.testing.assert_allclose(action[:6], 0.0, atol=1e-5)  # first pose = origin+identity
+    # no metadata, no calib, no OAK-only stream → the camera can't be told
+    assert ds.meta.episodes[0]["depth_camera"] == "unknown"
 
 
 # --- depth -----------------------------------------------------------------------
@@ -191,3 +196,109 @@ def test_build_dataset_multi_depth(tmp_path):
                                           "observation.images.right_cam1_depth"]
     for key in ds.meta.depth_keys:
         _assert_depth_roundtrip(ds, key)
+
+
+# --- right image, IMU, depth-camera model ------------------------------------------
+IMU_DT_MS = 5  # ~200 Hz
+
+
+def _add_oakd_streams(ep_dir):
+    """What an OAK-D episode has on top of the shared streams: a right image and
+    the BNO086 IMU (accel ramps with time, constant gyro, fixed rotation)."""
+    _write_video(ep_dir / "dcam_right.mp4", N)
+    (ep_dir / "dcam_right_timestamps.json").write_text(
+        json.dumps({"samples": [{"host_ms": t} for t in TS_MS]}))
+    samples = []
+    for t in range(0, TS_MS[-1] + 1, IMU_DT_MS):
+        samples += [
+            {"kind": "accel", "host_ms": t, "value": [t / 1000.0, 0.0, 9.81]},
+            {"kind": "gyro", "host_ms": t, "value": [0.0, 0.5, 0.0]},
+            {"kind": "rotation", "host_ms": t, "value": [0.0, 0.0, 0.0, 1.0, 0.01]},
+        ]
+    (ep_dir / "dcam_imu.json").write_text(json.dumps({"samples": samples}))
+    return ep_dir
+
+
+def _set_camera(ep_dir, model):
+    (ep_dir / "metadata.json").write_text(json.dumps({"depth_camera": {"model": model}}))
+    return ep_dir
+
+
+def test_build_dataset_right_and_imu(tmp_path):
+    ep = _set_camera(_add_oakd_streams(_make_episode(tmp_path / "ep0")), "oakd")
+    root = tmp_path / "ds"
+    build_dataset("test/grabette_oakd", [ep], task="pick", fps=30, root=root,
+                  with_depth=False)
+
+    from lerobot.datasets import LeRobotDataset
+
+    from grabette_postprocess.dataset import IMU_NAMES
+    ds = LeRobotDataset("test/grabette_oakd", root=root)
+    feats = ds.meta.features
+    assert feats["observation.images.cam1_right"]["shape"] == feats[
+        "observation.images.cam1_left"]["shape"]
+    assert list(feats["imu"]["names"]) == IMU_NAMES
+    assert ds.meta.total_frames == N
+
+    for i, t in enumerate(TS_MS):
+        imu = np.asarray(ds[i]["imu"]).ravel()
+        np.testing.assert_allclose(imu[:3], [t / 1000.0, 0.0, 9.81], atol=1e-5)
+        np.testing.assert_allclose(imu[3:6], [0.0, 0.5, 0.0], atol=1e-6)
+        np.testing.assert_allclose(imu[6:], [0.0, 0.0, 0.0, 1.0], atol=1e-6)
+    assert ds.meta.episodes[0]["depth_camera"] == "oakd"
+
+
+def test_build_dataset_mixed_cameras_drops_optional_streams(tmp_path):
+    """OAK-D + Gemini in one dataset: the schema can't hold a right image / IMU
+    for every episode, so both are left out — and the camera column tells the
+    episodes apart."""
+    oak = _set_camera(_add_oakd_streams(_make_episode(tmp_path / "ep0")), "oakd")
+    gemini = _set_camera(_make_episode(tmp_path / "ep1"), "gemini305")
+    root = tmp_path / "ds"
+    build_dataset("test/grabette_mixed", [oak, gemini], task="pick", fps=30,
+                  root=root, with_depth=False)
+
+    from lerobot.datasets import LeRobotDataset
+    ds = LeRobotDataset("test/grabette_mixed", root=root)
+    assert ds.meta.total_episodes == 2
+    assert "observation.images.cam1_right" not in ds.meta.features
+    assert "imu" not in ds.meta.features
+    assert [ds.meta.episodes[i]["depth_camera"] for i in range(2)] == ["oakd", "gemini305"]
+
+
+def test_build_dataset_multi_right_imu_camera(tmp_path):
+    from grabette_postprocess.dataset import build_dataset_multi
+
+    groups = {"rec0": {r: _set_camera(_add_oakd_streams(_make_episode(tmp_path / "rec0" / r)),
+                                      "oakd")
+                       for r in ("left", "right")}}
+    root = tmp_path / "ds"
+    build_dataset_multi("test/grabette_multi_oakd", groups, ["left", "right"],
+                        task="pick", fps=30, root=root, with_depth=False)
+
+    from lerobot.datasets import LeRobotDataset
+    ds = LeRobotDataset("test/grabette_multi_oakd", root=root)
+    feats = ds.meta.features
+    for r in ("left", "right"):
+        for cam in ("cam0", "cam1_left", "cam1_right"):
+            assert f"observation.images.{r}_{cam}" in feats
+        assert ds.meta.episodes[0][f"{r}_depth_camera"] == "oakd"
+    assert tuple(feats["imu"]["shape"]) == (20,)
+    assert feats["imu"]["names"][0] == "left_ax" and feats["imu"]["names"][10] == "right_ax"
+
+
+def test_depth_camera_model_fallbacks(tmp_path):
+    from grabette_postprocess.episode_files import depth_camera_model
+
+    ep = tmp_path / "ep"
+    ep.mkdir()
+    assert depth_camera_model(ep) == "unknown"
+    (ep / "dcam_calib.json").write_text(json.dumps({"name": "Orbbec Gemini 305"}))
+    assert depth_camera_model(ep) == "gemini305"
+    (ep / "dcam_calib.json").write_text(json.dumps({"productName": "OAK-D-SR"}))
+    assert depth_camera_model(ep) == "oakd"
+    (ep / "dcam_calib.json").unlink()
+    (ep / "oakd_imu.json").write_text("{}")  # legacy name, OAK-only stream
+    assert depth_camera_model(ep) == "oakd"
+    _set_camera(ep, "gemini305")  # metadata wins
+    assert depth_camera_model(ep) == "gemini305"

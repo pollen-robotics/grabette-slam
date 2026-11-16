@@ -1,22 +1,31 @@
 """LeRobot v3 dataset builder for GRABETTE.
 
 Converts trajectory + capture data into LeRobot v3 format (Parquet + MP4).
-Two camera observations: cam0 (RPi fisheye, raw_video.mp4) and cam1 (depth camera
-left, dcam_left.mp4), both selected nearest-by-timestamp against the trajectory.
-Plus, unless disabled, cam1_depth: the depth map (dcam_depth.mkv, uint16 mm),
-pixel-registered to cam1's sensor, stored as a LeRobot depth stream (see
-DEPTH_QUANTIZATION).
+Camera observations, all selected nearest-by-timestamp against the trajectory:
+  - cam0: RPi fisheye (raw_video.mp4)
+  - cam1_left: depth camera left image (dcam_left.mp4)
+  - cam1_right: depth camera right image (dcam_right.mp4) — OAK-D only, the
+    Gemini 305 records no right image; built exactly like cam1_left.
+  - cam1_depth (unless disabled): the depth map (dcam_depth.mkv, uint16 mm),
+    pixel-registered to cam1_left's sensor, stored as a LeRobot depth stream
+    (see DEPTH_QUANTIZATION).
+Plus `imu` (accel, gyro, fused rotation; OAK-D only) resampled onto the frames,
+and a per-episode `depth_camera` model column in the episodes metadata.
+
+A LeRobot schema is the same for every episode, so cam1_right / imu are added
+only when every episode has them (see _optional_stream_policy).
 """
 
 import json
 from pathlib import Path
 
-from grabette_postprocess.episode_files import resolve
+from grabette_postprocess.episode_files import depth_camera_model, resolve
 
 import av
 import cv2
 import numpy as np
 
+from grabette_postprocess.convert import fit_device_to_host_s
 from grabette_postprocess.episode_manager import find_trajectory_csv
 from grabette_postprocess.trajectory import (
     load_trajectory_csv,
@@ -33,7 +42,7 @@ FEATURES_BASE = {
         "shape": (3, 720, 960),  # C, H, W — LeRobot convention
         "names": ["channels", "height", "width"],
     },
-    "observation.images.cam1": {
+    "observation.images.cam1_left": {
         "dtype": "video",
         "shape": (3, 720, 960),  # depth camera left, resized to image_size like cam0
         "names": ["channels", "height", "width"],
@@ -84,6 +93,17 @@ DEPTH_QUANTIZATION = {
 # Native depth resolution of both supported depth cameras (OAK-D SR default and
 # Orbbec Gemini 305). Kept native — resizing depth would interpolate across edges.
 DEPTH_SIZE = (400, 640)  # (H, W)
+
+
+# --- IMU -----------------------------------------------------------------------
+# One row per dataset frame, resampled from the ~200 Hz dcam_imu.json streams:
+# accel (m/s²) and gyro (rad/s) linearly interpolated, the fused rotation
+# quaternion (IMU body → gravity-aligned world, [qx, qy, qz, qw]) taken from the
+# nearest sample. Expressed in the IMU's own frame (imu_to_cam is in
+# dcam_calib_offline.json). Like `is_lost`, the key has no "observation." prefix:
+# lerobot would otherwise turn it into a second STATE input of every policy.
+IMU_NAMES = ["ax", "ay", "az", "wx", "wy", "wz", "qx", "qy", "qz", "qw"]
+_IMU_KINDS = (("accel", 3), ("gyro", 3), ("rotation", 4))
 
 
 def _depth_feature(size: tuple[int, int]) -> dict:
@@ -144,11 +164,12 @@ def _load_video_timestamps(episode_dir: Path, video_path: Path) -> np.ndarray:
     return np.arange(n_frames, dtype=np.float64) / video_fps
 
 
-def _load_dcam_left_timestamps(episode_dir: Path) -> np.ndarray | None:
-    """Per-frame host_ms timestamps (seconds) for dcam_left.mp4 — the same clock
-    the SLAM stamps the trajectory with (convert.py feeds host_ms), so nearest-ts
-    matching against the trajectory is exact. None when missing/empty."""
-    ts_path = resolve(episode_dir, "dcam_left_timestamps.json")
+def _load_dcam_timestamps(episode_dir: Path, side: str = "left") -> np.ndarray | None:
+    """Per-frame host_ms timestamps (seconds) for dcam_{side}.mp4 — the same
+    clock the SLAM stamps the trajectory with (convert.py feeds the left stream's
+    host_ms), so nearest-ts matching against the trajectory is exact. None when
+    missing/empty."""
+    ts_path = resolve(episode_dir, f"dcam_{side}_timestamps.json")
     if not ts_path.is_file():
         return None
     with open(ts_path) as f:
@@ -156,6 +177,93 @@ def _load_dcam_left_timestamps(episode_dir: Path) -> np.ndarray | None:
     if not samples:
         return None
     return np.array([s["host_ms"] for s in samples], dtype=np.float64) / 1000.0
+
+
+def _has_right(episode_dir: Path) -> bool:
+    """dcam_right.mp4 + its timestamps (OAK-D recordings)."""
+    return (resolve(episode_dir, "dcam_right.mp4").is_file()
+            and _load_dcam_timestamps(episode_dir, "right") is not None)
+
+
+def _has_imu(episode_dir: Path) -> bool:
+    """dcam_imu.json with at least one sample (OAK-D recordings)."""
+    return _load_imu(episode_dir) is not None
+
+
+def _load_imu(episode_dir: Path) -> dict | None:
+    """dcam_imu.json → {kind: (ts_s (n,), values (n, dim))} on the host clock of
+    the frames, or None when the episode has no IMU.
+
+    Timestamps go through the same device→host fit as the SLAM input
+    (convert.fit_device_to_host_s on the left frame stream), so the IMU lines up
+    with the frames exactly as it did for SLAM; raw host_ms otherwise."""
+    imu_path = resolve(episode_dir, "dcam_imu.json")
+    if not imu_path.is_file():
+        return None
+    with open(imu_path) as f:
+        samples = json.load(f).get("samples", [])
+    if not samples:
+        return None
+    left_ts = resolve(episode_dir, "dcam_left_timestamps.json")
+    fit = None
+    if left_ts.is_file():
+        with open(left_ts) as f:
+            fit = fit_device_to_host_s(json.load(f).get("samples", []))
+
+    out: dict = {}
+    for kind, dim in _IMU_KINDS:
+        ts, vals = [], []
+        for s in samples:
+            v = s.get("value")
+            if s.get("kind") != kind or not v or len(v) < dim:
+                continue
+            if fit is not None and "device_us" in s:
+                ts.append(fit[0] * s["device_us"] * 1e-6 + fit[1])
+            else:
+                ts.append(float(s["host_ms"]) * 1e-3)
+            vals.append(v[:dim])
+        if ts:
+            order = np.argsort(ts, kind="stable")
+            out[kind] = (np.asarray(ts, dtype=np.float64)[order],
+                         np.asarray(vals, dtype=np.float64)[order])
+    return out or None
+
+
+def _imu_at(imu: dict, query_ts: np.ndarray) -> np.ndarray:
+    """(N, 10) IMU rows at `query_ts` (see IMU_NAMES). accel/gyro are linearly
+    interpolated (held at the ends), rotation is the nearest sample — averaging
+    quaternions componentwise would not stay a rotation. A stream the episode
+    lacks is left at zero."""
+    out = np.zeros((len(query_ts), len(IMU_NAMES)), dtype=np.float32)
+    col = 0
+    for kind, dim in _IMU_KINDS:
+        if kind in imu:
+            ts, vals = imu[kind]
+            if kind == "rotation":
+                out[:, col:col + dim] = vals[_nearest_frame_indices(query_ts, ts)]
+            else:
+                for j in range(dim):
+                    out[:, col + j] = np.interp(query_ts, ts, vals[:, j])
+        col += dim
+    return out
+
+
+def _optional_stream_policy(name: str, wanted: bool | None, present: list[bool]) -> bool:
+    """Whether to add an optional per-arm stream (cam1_right, imu) to the schema.
+
+    wanted=None (auto): only when EVERY episode has it — a LeRobot schema is
+    uniform, and dropping the episodes that lack it (e.g. every Gemini episode
+    of a mixed dataset) would be worse than dropping the stream.
+    wanted=True: always; episodes lacking it are then skipped (like depth).
+    """
+    if wanted is not None:
+        return wanted
+    if all(present):
+        return bool(present)
+    if any(present):
+        print(f"  Note: {name} left out — only {sum(present)}/{len(present)} "
+              f"episode(s) have it (pass it explicitly to keep it and skip the rest)")
+    return False
 
 
 def _load_depth_samples(episode_dir: Path) -> list[dict] | None:
@@ -268,6 +376,8 @@ def build_dataset(
     recording_name_of=None,
     with_depth: bool = True,
     depth_size: tuple[int, int] = DEPTH_SIZE,
+    with_right: bool | None = None,
+    with_imu: bool | None = None,
 ):
     """Build LeRobot v3 dataset from processed episode directories.
 
@@ -299,33 +409,46 @@ def build_dataset(
             raw dataset is role-partitioned ({episode_id}/{role}), so episodes
             key by episode_id instead of the (colliding) role.
         with_depth: add `observation.images.cam1_depth` (depth map registered
-            to cam1, uint16 mm, quantized per DEPTH_QUANTIZATION). Episodes
+            to cam1_left, uint16 mm, quantized per DEPTH_QUANTIZATION). Episodes
             without depth are then skipped, since the schema must be uniform.
         depth_size: (height, width) of the stored depth maps (native by default).
+        with_right: add `observation.images.cam1_right` (dcam_right.mp4, built
+            like cam1_left). None = only when every episode has it; True = always,
+            skipping episodes without it; False = never.
+        with_imu: add `imu` (see IMU_NAMES), same None/True/False rule.
+
+    Every saved episode also gets a `depth_camera` column in the episodes
+    metadata ("oakd", "gemini305", … or "unknown", see depth_camera_model).
     """
     # Lazy import — lerobot is a heavy dependency
     from lerobot.configs import RGBEncoderConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     name_of = recording_name_of or (lambda d: Path(d).name)
+    episode_dirs = [Path(d).absolute() for d in episode_dirs]
 
     if fps is None:
         fps = 30.0
         print(f"Using default fps: {int(fps)}")
 
+    with_right = _optional_stream_policy(
+        "cam1_right", with_right, [_has_right(d) for d in episode_dirs])
+    with_imu = _optional_stream_policy(
+        "imu", with_imu, [_has_imu(d) for d in episode_dirs])
+
     # Build feature schema
     features = FEATURES_BASE.copy()
     h, w = image_size
-    features["observation.images.cam0"] = {
-        **features["observation.images.cam0"],
-        "shape": (3, h, w),
-    }
-    features["observation.images.cam1"] = {
-        **features["observation.images.cam1"],
-        "shape": (3, h, w),
-    }
+    rgb_feature = {**features["observation.images.cam0"], "shape": (3, h, w)}
+    features["observation.images.cam0"] = rgb_feature
+    features["observation.images.cam1_left"] = rgb_feature
+    if with_right:
+        features["observation.images.cam1_right"] = rgb_feature
     if with_depth:
         features["observation.images.cam1_depth"] = _depth_feature(depth_size)
+    if with_imu:
+        features["imu"] = {"dtype": "float32", "shape": (len(IMU_NAMES),),
+                           "names": list(IMU_NAMES)}
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
@@ -346,9 +469,9 @@ def build_dataset(
     # Source recording name per saved episode, aligned with episode_index (0..N-1
     # in save order). Episodes skipped below (no trajectory CSV) are not appended.
     saved_recordings: list[str] = []
+    camera_by_recording: dict[str, str] = {}
 
     for ep_dir in episode_dirs:
-        ep_dir = Path(ep_dir).absolute()
         print(f"\nProcessing {ep_dir.name}...")
 
         # Find trajectory file
@@ -360,6 +483,13 @@ def build_dataset(
         if with_depth and depth_samples is None:
             print("  Skipping: no depth (dcam_depth.mkv / dcam_depth/ + timestamps)")
             continue
+        if with_right and not _has_right(ep_dir):
+            print("  Skipping: no right image (dcam_right.mp4 + timestamps)")
+            continue
+        imu = _load_imu(ep_dir) if with_imu else None
+        if with_imu and imu is None:
+            print("  Skipping: no IMU (dcam_imu.json)")
+            continue
 
         # Trajectory timestamps in seconds, relative to recording start (t=0),
         # and the 8D absolute-state action [x,y,z,ax,ay,az,proximal,distal].
@@ -369,6 +499,7 @@ def build_dataset(
         actions = _episode_actions(df, traj_ts, ep_dir)
         # Per-frame SLAM tracking-lost flag, aligned with the action rows.
         is_lost = df['is_lost'].astype(np.float32).values
+        imu_rows = _imu_at(imu, traj_ts) if with_imu else None
 
         # --- cam0: RPi video, nearest-by-timestamp frame selection ---
         video_path = ep_dir / "raw_video.mp4"
@@ -378,13 +509,16 @@ def build_dataset(
         cam0_cache = _load_video_frames_indexed(video_path, image_size,
                                                 set(cam0_indices.tolist()))
 
-        # --- cam1: depth-camera left video, same nearest-by-timestamp selection ---
-        dcam_path = resolve(ep_dir, "dcam_left.mp4")
-        dcam_ts = _load_dcam_left_timestamps(ep_dir)
-        print(f"  Depth-camera left video: {len(dcam_ts)} frames, {dcam_ts[-1]:.2f}s")
-        cam1_indices = _nearest_frame_indices(traj_ts, dcam_ts)
-        cam1_cache = _load_video_frames_indexed(dcam_path, image_size,
-                                                set(cam1_indices.tolist()))
+        # --- cam1_left / cam1_right: depth-camera images, same selection ---
+        sides = ["left", "right"] if with_right else ["left"]
+        dcam_indices, dcam_caches = {}, {}
+        for side in sides:
+            side_ts = _load_dcam_timestamps(ep_dir, side)
+            print(f"  Depth-camera {side} video: {len(side_ts)} frames, {side_ts[-1]:.2f}s")
+            dcam_indices[side] = _nearest_frame_indices(traj_ts, side_ts)
+            dcam_caches[side] = _load_video_frames_indexed(
+                resolve(ep_dir, f"dcam_{side}.mp4"), image_size,
+                set(dcam_indices[side].tolist()))
 
         # --- depth: own timestamps (same host clock), same nearest-ts selection ---
         if with_depth:
@@ -394,39 +528,51 @@ def build_dataset(
             depth_cache = _load_depth_frames_indexed(
                 ep_dir, depth_samples, depth_size, set(depth_indices.tolist()))
 
+        wrote = 0
         for i in range(n_frames):
             img = cam0_cache.get(cam0_indices[i])
-            dcam_img = cam1_cache.get(cam1_indices[i])
+            dcam_imgs = {s: dcam_caches[s].get(dcam_indices[s][i]) for s in sides}
             depth = depth_cache.get(depth_indices[i]) if with_depth else None
-            if img is None or dcam_img is None or (with_depth and depth is None):
-                which = ("RPi" if img is None else
-                         "depth-camera left" if dcam_img is None else "depth")
-                print(f"  Warning: missing {which} frame at step {i}, t={traj_ts[i]:.3f}s")
+            missing = ("RPi" if img is None else
+                       next((f"depth-camera {s}" for s in sides if dcam_imgs[s] is None),
+                            "depth" if with_depth and depth is None else None))
+            if missing:
+                print(f"  Warning: missing {missing} frame at step {i}, t={traj_ts[i]:.3f}s")
                 break
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            dcam_rgb = cv2.cvtColor(dcam_img, cv2.COLOR_BGR2RGB)
 
             frame = {
                 "task": task,
-                "observation.images.cam0": img_rgb,
-                "observation.images.cam1": dcam_rgb,
+                "observation.images.cam0": cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
                 "action": actions[i],
                 "is_lost": np.array([is_lost[i]], dtype=np.float32),
             }
+            for s in sides:
+                frame[f"observation.images.cam1_{s}"] = cv2.cvtColor(dcam_imgs[s],
+                                                                     cv2.COLOR_BGR2RGB)
             if with_depth:
                 frame["observation.images.cam1_depth"] = depth  # uint16 mm
+            if with_imu:
+                frame["imu"] = imu_rows[i]
             dataset.add_frame(frame)
+            wrote += 1
 
+        if wrote == 0:
+            print("  Skipping: no usable frames")
+            continue
         dataset.save_episode()
-        saved_recordings.append(name_of(ep_dir))
-        print(f"  Saved episode: {n_frames} frames")
+        rec = name_of(ep_dir)
+        saved_recordings.append(rec)
+        camera_by_recording[rec] = depth_camera_model(ep_dir)
+        print(f"  Saved episode: {wrote} frames (depth camera: {camera_by_recording[rec]})")
 
     dataset.finalize()
 
     if source_user:
         _write_episode_sources(Path(dataset.root), saved_recordings, source_user)
+    columns = {"depth_camera": camera_by_recording}
     if tags_by_recording is not None:
-        _write_episode_tags(Path(dataset.root), saved_recordings, tags_by_recording)
+        columns["tags"] = tags_by_recording
+    _write_episode_columns(Path(dataset.root), saved_recordings, columns)
 
     print(f"\nDataset complete: {repo_id}")
     if root:
@@ -451,24 +597,32 @@ def _load_capture_started(ep_dir: Path) -> float | None:
 
 
 def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int],
-                      with_depth: bool = False) -> dict:
+                      with_depth: bool = False, with_right: bool = False,
+                      with_imu: bool = False) -> dict:
     """Load one arm's SLAM trajectory + 8D actions + is_lost + per-video
-    timestamps (cam0 RPi fisheye, cam1 depth-camera left, and the depth map when
-    with_depth) for nearest-ts frame selection, plus its capture_started clock.
-    Raises if the trajectory or a video is missing (a valid grabette arm always
-    has all of them — depth included, it is the SLAM input)."""
+    timestamps (cam0 RPi fisheye, cam1_left depth-camera left, plus cam1_right,
+    the depth map and the IMU when asked) for nearest-ts frame selection, plus
+    its capture_started clock and depth-camera model.
+    Raises if the trajectory or a requested stream is missing (a valid grabette
+    arm always has left + depth — depth is the SLAM input)."""
     ep_dir = Path(ep_dir).absolute()
     traj_path = find_trajectory_csv(ep_dir)
     if traj_path is None:
         raise ValueError(f"no trajectory CSV in {ep_dir}")
     df = load_trajectory_csv(traj_path)
     traj_ts = df["timestamp"].values.astype(np.float64)
-    cam1_ts = _load_dcam_left_timestamps(ep_dir)
-    if cam1_ts is None:
-        raise ValueError(f"no depth-camera left timestamps in {ep_dir}")
+    dcam = {}
+    for side in (("left", "right") if with_right else ("left",)):
+        ts = _load_dcam_timestamps(ep_dir, side)
+        if ts is None or not resolve(ep_dir, f"dcam_{side}.mp4").is_file():
+            raise ValueError(f"no depth-camera {side} video + timestamps in {ep_dir}")
+        dcam[side] = (resolve(ep_dir, f"dcam_{side}.mp4"), ts)
     depth_samples = _load_depth_samples(ep_dir) if with_depth else None
     if with_depth and depth_samples is None:
         raise ValueError(f"no depth (dcam_depth.mkv / dcam_depth/ + timestamps) in {ep_dir}")
+    imu = _load_imu(ep_dir) if with_imu else None
+    if with_imu and imu is None:
+        raise ValueError(f"no IMU (dcam_imu.json) in {ep_dir}")
     return {
         "depth_samples": depth_samples,
         "depth_ts": _depth_timestamps(depth_samples) if depth_samples else None,
@@ -478,8 +632,9 @@ def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int],
         "is_lost": df["is_lost"].astype(np.float32).values,     # (N,)
         "cam0_path": ep_dir / "raw_video.mp4",
         "cam0_ts": _load_video_timestamps(ep_dir, ep_dir / "raw_video.mp4"),
-        "cam1_path": resolve(ep_dir, "dcam_left.mp4"),
-        "cam1_ts": cam1_ts,
+        "dcam": dcam,                                           # {side: (path, ts)}
+        "imu": imu,
+        "depth_camera": depth_camera_model(ep_dir),
         "started": _load_capture_started(ep_dir),
     }
 
@@ -496,17 +651,22 @@ def build_dataset_multi(
     tags_by_recording: dict[str, list[str]] | None = None,
     with_depth: bool = True,
     depth_size: tuple[int, int] = DEPTH_SIZE,
+    with_right: bool | None = None,
+    with_imu: bool | None = None,
 ):
     """Build a LeRobot v3 dataset with a uniform, role-prefixed schema for ONE OR
     MORE arms (roles). Mono is just the single-role case of this: a lone left
-    grabette yields observation.images.left_cam0/left_cam1 + action [left_x…] (8D),
-    exactly the left block of a bimanual episode — so mono and bimanual share one
-    format, differing only in how many arms are present.
+    grabette yields observation.images.left_cam0/left_cam1_left + action
+    [left_x…] (8D), exactly the left block of a bimanual episode — so mono and
+    bimanual share one format, differing only in how many arms are present.
 
-    Per role: observation.images.{role}_cam0 (RPi fisheye) + {role}_cam1 (depth
-    camera left), plus {role}_cam1_depth when with_depth (see build_dataset);
-    `action` is the per-role 8D absolute states concatenated (in `roles`
-    order); `is_lost` is per-role.
+    Per role: observation.images.{role}_cam0 (RPi fisheye) + {role}_cam1_left
+    (depth camera left), plus {role}_cam1_right / {role}_cam1_depth when enabled
+    (see build_dataset); `action` is the per-role 8D absolute states concatenated
+    (in `roles` order); `is_lost` is per-role, and so is `imu` (10 per role) when
+    enabled. with_right / with_imu: None = only when every arm of every recording
+    has it, True = always (recordings lacking it are skipped), False = never.
+    The episodes metadata gets a `{role}_depth_camera` column per role.
 
     groups: {episode_id: {role: arm_episode_dir}} — one entry per synchronized
         recording. A group missing any of `roles` is skipped (can't pair it).
@@ -521,9 +681,16 @@ def build_dataset_multi(
         print(f"Using default fps: {int(fps)}")
     h, w = image_size
 
+    arm_dirs = [Path(g[r]) for g in groups.values() for r in roles if r in g]
+    with_right = _optional_stream_policy(
+        "cam1_right", with_right, [_has_right(d) for d in arm_dirs])
+    with_imu = _optional_stream_policy(
+        "imu", with_imu, [_has_imu(d) for d in arm_dirs])
+    sides = ("left", "right") if with_right else ("left",)
+
     features: dict = {}
     for role in roles:
-        for cam in ("cam0", "cam1"):
+        for cam in ("cam0", *(f"cam1_{s}" for s in sides)):
             features[f"observation.images.{role}_{cam}"] = {
                 "dtype": "video", "shape": (3, h, w),
                 "names": ["channels", "height", "width"],
@@ -539,6 +706,11 @@ def build_dataset_multi(
         "dtype": "float32", "shape": (len(roles),),
         "names": [f"{r}_is_lost" for r in roles],
     }
+    if with_imu:
+        features["imu"] = {
+            "dtype": "float32", "shape": (len(IMU_NAMES) * len(roles),),
+            "names": [f"{r}_{n}" for r in roles for n in IMU_NAMES],
+        }
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id, fps=int(fps), features=features, root=root,
@@ -550,6 +722,7 @@ def build_dataset_multi(
 
     ref_role = roles[0]
     saved: list[str] = []
+    camera_columns: dict[str, dict[str, str]] = {f"{r}_depth_camera": {} for r in roles}
     for ep_id in sorted(groups):
         group = groups[ep_id]
         missing = [r for r in roles if r not in group]
@@ -557,7 +730,14 @@ def build_dataset_multi(
             print(f"  Skipping {ep_id}: missing arm(s) {missing}")
             continue
         print(f"\nProcessing {ep_id} ({'+'.join(roles)})...")
-        arms = {r: _load_arm_streams(group[r], image_size, with_depth) for r in roles}
+        try:
+            arms = {r: _load_arm_streams(group[r], image_size, with_depth,
+                                         with_right, with_imu) for r in roles}
+        except ValueError as e:
+            if not (with_right or with_imu):
+                raise  # left/depth/trajectory missing: a broken arm, as before
+            print(f"  Skipping {ep_id}: {e}")
+            continue
         ref = arms[ref_role]
         full_ref_ts = ref["traj_ts"]
 
@@ -585,52 +765,62 @@ def build_dataset_multi(
             print(f"  Skipping {ep_id}: arms don't overlap in time")
             continue
 
-        # Per role: nearest indices into its trajectory + both videos, on the
+        # Per role: nearest indices into its trajectory + every video, on the
         # (trimmed) reference timeline shifted onto that arm's own clock. For the
         # reference role the shift is zero → maps back to its original indices.
-        idxs: dict[str, tuple] = {}
-        caches: dict[str, tuple] = {}
+        # Each entry: {stream: (indices, cache)}; IMU rows are resampled directly.
+        per_role: dict[str, dict] = {}
+        imu_rows: dict[str, np.ndarray] = {}
+        traj_idxs: dict[str, np.ndarray] = {}
         for r in roles:
             a = arms[r]
             q = ref_ts + deltas[r]
-            traj_idx = _nearest_frame_indices(q, a["traj_ts"])
+            traj_idxs[r] = _nearest_frame_indices(q, a["traj_ts"])
+            streams = {}
             cam0_idx = _nearest_frame_indices(q, a["cam0_ts"])
-            cam1_idx = _nearest_frame_indices(q, a["cam1_ts"])
-            depth_idx = _nearest_frame_indices(q, a["depth_ts"]) if with_depth else None
-            idxs[r] = (traj_idx, cam0_idx, cam1_idx, depth_idx)
-            caches[r] = (
-                _load_video_frames_indexed(a["cam0_path"], image_size, set(cam0_idx.tolist())),
-                _load_video_frames_indexed(a["cam1_path"], image_size, set(cam1_idx.tolist())),
-                _load_depth_frames_indexed(a["dir"], a["depth_samples"], depth_size,
-                                           set(depth_idx.tolist())) if with_depth else {},
-            )
+            streams["cam0"] = (cam0_idx, _load_video_frames_indexed(
+                a["cam0_path"], image_size, set(cam0_idx.tolist())))
+            for side in sides:
+                path, ts = a["dcam"][side]
+                idx = _nearest_frame_indices(q, ts)
+                streams[f"cam1_{side}"] = (idx, _load_video_frames_indexed(
+                    path, image_size, set(idx.tolist())))
+            if with_depth:
+                idx = _nearest_frame_indices(q, a["depth_ts"])
+                streams["cam1_depth"] = (idx, _load_depth_frames_indexed(
+                    a["dir"], a["depth_samples"], depth_size, set(idx.tolist())))
+            per_role[r] = streams
+            if with_imu:
+                imu_rows[r] = _imu_at(a["imu"], q)
 
         wrote = 0
         for i in range(n_frames):
             frame: dict = {"task": task}
-            act_parts, lost_parts = [], []
+            act_parts, lost_parts, imu_parts = [], [], []
             ok = True
             for r in roles:
-                traj_idx, cam0_idx, cam1_idx, depth_idx = idxs[r]
-                cam0_cache, cam1_cache, depth_cache = caches[r]
-                im0 = cam0_cache.get(cam0_idx[i])
-                im1 = cam1_cache.get(cam1_idx[i])
-                depth = depth_cache.get(depth_idx[i]) if with_depth else None
-                if im0 is None or im1 is None or (with_depth and depth is None):
-                    ok = False
+                for name, (idx, cache) in per_role[r].items():
+                    img = cache.get(idx[i])
+                    if img is None:
+                        ok = False
+                        break
+                    frame[f"observation.images.{r}_{name}"] = (
+                        img if name == "cam1_depth"  # uint16 mm
+                        else cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                if not ok:
                     break
-                frame[f"observation.images.{r}_cam0"] = cv2.cvtColor(im0, cv2.COLOR_BGR2RGB)
-                frame[f"observation.images.{r}_cam1"] = cv2.cvtColor(im1, cv2.COLOR_BGR2RGB)
-                if with_depth:
-                    frame[f"observation.images.{r}_cam1_depth"] = depth  # uint16 mm
-                ti = traj_idx[i]
+                ti = traj_idxs[r][i]
                 act_parts.append(arms[r]["actions"][ti])
                 lost_parts.append(arms[r]["is_lost"][ti])
+                if with_imu:
+                    imu_parts.append(imu_rows[r][i])
             if not ok:
                 print(f"  Warning: missing frame at step {i} for {ep_id}")
                 break
             frame["action"] = np.concatenate(act_parts).astype(np.float32)
             frame["is_lost"] = np.array(lost_parts, dtype=np.float32)
+            if with_imu:
+                frame["imu"] = np.concatenate(imu_parts).astype(np.float32)
             dataset.add_frame(frame)
             wrote += 1
 
@@ -639,13 +829,18 @@ def build_dataset_multi(
             continue
         dataset.save_episode()
         saved.append(ep_id)
-        print(f"  Saved episode {ep_id}: {wrote} frames")
+        for r in roles:
+            camera_columns[f"{r}_depth_camera"][ep_id] = arms[r]["depth_camera"]
+        cams = ", ".join(f"{r}={arms[r]['depth_camera']}" for r in roles)
+        print(f"  Saved episode {ep_id}: {wrote} frames (depth camera: {cams})")
 
     dataset.finalize()
     if source_user:
         _write_episode_sources(Path(dataset.root), saved, source_user)
+    columns: dict = dict(camera_columns)
     if tags_by_recording is not None:
-        _write_episode_tags(Path(dataset.root), saved, tags_by_recording)
+        columns["tags"] = tags_by_recording
+    _write_episode_columns(Path(dataset.root), saved, columns)
     print(f"\nDataset complete: {repo_id}")
 
 
@@ -668,38 +863,64 @@ def _write_episode_sources(ds_root: Path, recordings: list[str], user: str) -> N
     print(f"  Wrote {out.name}: {len(entries)} episode(s) tagged with user '{user}'")
 
 
-def _write_episode_tags(ds_root: Path, recordings: list[str],
-                        tags_by_recording: dict[str, list[str]]) -> None:
-    """Add a per-episode `tags` (list[str]) column to the LeRobot episodes metadata
+def _write_episode_columns(ds_root: Path, recordings: list[str],
+                           columns: dict[str, dict]) -> None:
+    """Add per-episode columns to the LeRobot episodes metadata
     (meta/episodes/*.parquet), aligned by episode_index (= save order).
 
-    LeRobot preserves extra episode-metadata columns and exposes them via
-    ``ds.meta.episodes[i]["tags"]``, so this stays inside the LeRobot format rather
-    than being an ignored sidecar. The column is always list<string> (empty list
-    when an episode has no tags) so the schema is stable whether or not any tag
-    fired. Uses pyarrow so the existing columns/types are preserved exactly."""
+    columns: {column_name: {recording_name: value}}. A value that is a list makes
+    a list<string> column (empty list when the recording has no entry, e.g.
+    `tags`); otherwise a string column ("unknown" when missing, e.g.
+    `depth_camera`). LeRobot preserves extra episode-metadata columns and exposes
+    them via ``ds.meta.episodes[i][name]``, so they stay inside the LeRobot format
+    rather than in an ignored sidecar. Uses pyarrow so the existing columns/types
+    are preserved exactly; idempotent on a re-run."""
     import glob
 
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    tags_by_index = {i: list(tags_by_recording.get(rec, []))
-                     for i, rec in enumerate(recordings)}
+    if not columns:
+        return
+    is_list = {name: name == "tags" or any(isinstance(v, (list, tuple))
+                                           for v in by_rec.values())
+               for name, by_rec in columns.items()}
+    by_index = {
+        name: {i: (list(by_rec.get(rec, [])) if is_list[name]
+                   else str(by_rec.get(rec, "unknown")))
+               for i, rec in enumerate(recordings)}
+        for name, by_rec in columns.items()
+    }
     files = sorted(glob.glob(str(ds_root / "meta" / "episodes" / "**" / "*.parquet"),
                              recursive=True))
     total = 0
     for f in files:
         table = pq.read_table(f)
-        if "tags" in table.column_names:  # idempotent on a re-run
-            table = table.drop(["tags"])
         indices = table.column("episode_index").to_pylist()
-        tags_arr = pa.array([tags_by_index.get(int(i), []) for i in indices],
-                            type=pa.list_(pa.string()))
-        table = table.append_column("tags", tags_arr)
+        for name, values in by_index.items():
+            if name in table.column_names:
+                table = table.drop([name])
+            if is_list[name]:
+                arr = pa.array([values.get(int(i), []) for i in indices],
+                               type=pa.list_(pa.string()))
+            else:
+                arr = pa.array([values.get(int(i), "unknown") for i in indices],
+                               type=pa.string())
+            table = table.append_column(name, arr)
         pq.write_table(table, f)
         total += len(indices)
-    n_tagged = sum(1 for v in tags_by_index.values() if v)
-    print(f"  Wrote per-episode tags: {total} episode(s), {n_tagged} with ≥1 tag")
+    if "tags" in by_index:
+        n_tagged = sum(1 for v in by_index["tags"].values() if v)
+        print(f"  Wrote per-episode tags: {total} episode(s), {n_tagged} with ≥1 tag")
+    others = [n for n in by_index if n != "tags"]
+    if others:
+        print(f"  Wrote per-episode {', '.join(others)}: {total} episode(s)")
+
+
+def _write_episode_tags(ds_root: Path, recordings: list[str],
+                        tags_by_recording: dict[str, list[str]]) -> None:
+    """Add a per-episode `tags` (list[str]) column — see _write_episode_columns."""
+    _write_episode_columns(ds_root, recordings, {"tags": tags_by_recording})
 
 
 def push_dataset(repo_id: str, root: Path, *, private: bool = False,

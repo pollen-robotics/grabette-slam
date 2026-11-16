@@ -27,6 +27,38 @@ BINARY = os.environ.get("VSLAM_BINARY", "/usr/local/bin/offline_vslam")
 # and hold the token in the env ONLY for its duration (see push_lerobot).
 _PUSH_LOCK = threading.Lock()
 
+# Optional dataset content the user can choose to keep (UI checkboxes, REST
+# `keep`). Everything else (cam0, cam1_left, action, is_lost, depth_camera, tags)
+# is always written. key -> UI label.
+CONTENT_OPTIONS = {
+    "depth": "Depth map (cam1_depth)",
+    "right": "Right image (cam1_right, OAK-D only)",
+    "imu": "IMU (OAK-D only)",
+}
+
+
+def content_kwargs(keep=None) -> dict:
+    """Builder kwargs for the optional content kept by the user.
+
+    keep: iterable of CONTENT_OPTIONS keys, or None for the default (everything).
+    A kept depth map is required (episodes without one are skipped, as before).
+    A kept right image / IMU is added only when every episode has one — the
+    Gemini 305 records neither, and a LeRobot schema is the same for every
+    episode — so ticking it never drops episodes (see dataset._optional_stream_policy).
+    """
+    if keep is None:
+        keep = CONTENT_OPTIONS
+    keep = set(keep)
+    unknown = keep - set(CONTENT_OPTIONS)
+    if unknown:
+        raise ValueError(f"Unknown content option(s): {', '.join(sorted(unknown))} "
+                         f"(expected {', '.join(CONTENT_OPTIONS)})")
+    return {
+        "with_depth": "depth" in keep,
+        "with_right": None if "right" in keep else False,
+        "with_imu": None if "imu" in keep else False,
+    }
+
 
 def _check_sync(episode_dir):
     """Thin adapter: run check_dcam_imu and normalise to {verdict, message}."""
@@ -99,7 +131,7 @@ def episode_label(ep: Path) -> str:
 
 
 def build_recordings(target_repo, task, root, episodes, report_by_ep,
-                     roles=None, source_user=None, log=print) -> list:
+                     roles=None, source_user=None, log=print, keep=None) -> list:
     """Build the LeRobot dataset on disk from the kept episode dirs, picking the
     schema from the raw layout. Shared by the UI run (build_lerobot) and the
     headless REST run so both produce the SAME dataset for the same raw input.
@@ -109,9 +141,12 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
         detect_roles.
 
     With roles → ONE uniform, role-prefixed schema for any arm count (mono is the
-    single-role case: left_cam0/left_cam1 + 8D left action; bimanual adds the
+    single-role case: left_cam0/left_cam1_left + 8D left action; bimanual adds the
     right block), built from the per-arm dirs paired back into synchronized
-    recordings. Without → the legacy flat single-arm schema (cam0/cam1, 8D).
+    recordings. Without → the legacy flat single-arm schema (cam0/cam1_left, 8D).
+
+    keep: optional content to keep (CONTENT_OPTIONS keys, see content_kwargs);
+        None keeps everything.
 
     Returns the list of built recordings (recording ids in the role layout,
     episode dirs in the flat one); callers use its length as the episode count.
@@ -119,6 +154,7 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
     from grabette_postprocess.checks.tags import episode_tags
     from grabette_postprocess.dataset import build_dataset, build_dataset_multi
 
+    content = content_kwargs(keep)
     roles = sorted(roles) if roles else detect_roles(episodes)
     if not roles:
         tags_by_recording = {ep.name: episode_tags(ep, report_by_ep.get(ep))
@@ -126,7 +162,7 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
         log(f"Building LeRobot dataset from {len(episodes)} episode(s)…")
         build_dataset(repo_id=target_repo, episode_dirs=episodes, task=task,
                       root=Path(root), source_user=source_user,
-                      tags_by_recording=tags_by_recording)
+                      tags_by_recording=tags_by_recording, **content)
         return list(episodes)
 
     # Role layout: pair the per-arm dirs back into one LeRobot episode each. A
@@ -153,7 +189,7 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
         f"{len(groups)} recording(s)…")
     build_dataset_multi(repo_id=target_repo, groups=groups, roles=roles, task=task,
                         root=Path(root), source_user=source_user,
-                        tags_by_recording=tags_by_recording)
+                        tags_by_recording=tags_by_recording, **content)
     return sorted(groups)
 
 
@@ -404,7 +440,7 @@ def _push_to_branch(ds, target_repo, branch, log, token, attempts=3):
 def build_lerobot(dataset_dir, target_repo, task, root, log=print,
                   should_stop=None, to_branch=False, on_progress=None,
                   token=None, gate=None, pre_review=None, review=None,
-                  run_sync=False) -> list:
+                  run_sync=False, keep=None) -> list:
     """Check + SLAM + build the LeRobot dataset on disk under `root`.
 
     Pipeline: completeness/sync prechecks → (pre_review drop) → convert+SLAM →
@@ -432,7 +468,10 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
         trajectory check came back flagged. When None, every episode is kept.
     run_sync: enable the debug-only sync diagnostics (pre-SLAM depth-cam↔gyro and
         post-SLAM image↔trajectory). Off by default.
+    keep: optional content to keep in the dataset (CONTENT_OPTIONS keys, see
+        content_kwargs); None keeps everything.
     """
+    content_kwargs(keep)  # reject a bad option before the slow SLAM, not after
     # No global HF_TOKEN here: this function only builds locally and resolves the
     # username via an explicit HfApi(token=token).whoami() below; the actual push
     # (push_lerobot) scopes the token under a lock itself.
@@ -503,7 +542,7 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
     # kept-but-flagged episodes stay filterable downstream.
     report_by_ep = {ep: report for ep, report in results}
     return build_recordings(target_repo, task, root, processed, report_by_ep,
-                            source_user=source_user, log=log)
+                            source_user=source_user, log=log, keep=keep)
 
 
 def push_lerobot(target_repo, task, root, n_episodes, to_branch=False,

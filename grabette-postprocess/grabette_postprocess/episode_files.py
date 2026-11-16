@@ -18,6 +18,7 @@ becomes a plain path join.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 CANONICAL_PREFIX = "dcam_"
@@ -91,6 +92,50 @@ def describe_camera(meta: dict) -> str:
     label = info.get("name") or info.get("model") or "unknown"
     serial = info.get("serial")
     return f"{label} ({serial})" if serial else label
+
+
+UNKNOWN_CAMERA = "unknown"
+
+
+def depth_camera_model(ep_dir: Path) -> str:
+    """Which depth camera recorded this episode: "oakd", "gemini305",
+    "stereo_uvc" (grabette's `depth_camera` setting) or "unknown".
+
+    The file names are vendor-neutral, so the model has to be read from the
+    episode itself, in order of reliability:
+      1. metadata.json `depth_camera.model` — written by every recent recording.
+      2. dcam_calib.json identity — vendor-specific keys: the OAK-D eeprom dump
+         carries `productName`, the Orbbec dump a `name` ("… Gemini 305 …").
+      3. Hardware-only streams: an IMU or a right image means OAK-D, since the
+         Gemini 305 records neither.
+    The legacy `oakd_*` names are NOT taken as evidence: Gemini episodes were
+    written under those names before the dcam_ rename.
+    """
+    ep_dir = Path(ep_dir)
+    meta_path = ep_dir / "metadata.json"
+    if meta_path.is_file():
+        try:
+            model = camera_info(json.loads(meta_path.read_text())).get("model")
+        except (OSError, ValueError):
+            model = None
+        if model:
+            return str(model)
+
+    calib_path = resolve(ep_dir, "dcam_calib.json")
+    if calib_path.is_file():
+        try:
+            calib = json.loads(calib_path.read_text())
+        except (OSError, ValueError):
+            calib = None
+        if isinstance(calib, dict):
+            if calib.get("productName"):
+                return "oakd"
+            if "gemini" in str(calib.get("name", "")).lower():
+                return "gemini305"
+
+    if resolve(ep_dir, "dcam_imu.json").is_file() or resolve(ep_dir, "dcam_right.mp4").is_file():
+        return "oakd"
+    return UNKNOWN_CAMERA
 
 
 def is_legacy_episode(ep_dir: Path) -> bool:
