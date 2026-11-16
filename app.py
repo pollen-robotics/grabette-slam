@@ -11,7 +11,7 @@ per browser session, so concurrent users never see each other's run or its flagg
 episodes.
 
 REST API (called by grabette devices):
-  POST /api/process  {source_repo, target_repo, task}  Authorization: Bearer <hf_token>  → {job_id}
+  POST /api/process  {source_repo, target_repo, task[, keep]}  Authorization: Bearer <hf_token>  → {job_id}
   GET  /api/status/{job_id}                                      → {status, log, error}
   GET  /api/quality/{target_repo}   (no auth, like /api/status)   → {status, quality, flagged, …}
 
@@ -33,6 +33,7 @@ from huggingface_hub import HfApi, snapshot_download
 from pydantic import BaseModel
 
 import review
+from pipeline import CONTENT_OPTIONS, content_kwargs
 from views import CSS, THEME, bar, space_banner, visualizer_url
 from controller import (
     confirm_cancel,
@@ -86,6 +87,16 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
             debug_sync = gr.Checkbox(
                 label="Run sync checks (debug)", value=False,
                 info="Extra camera↔IMU / image↔trajectory timing diagnostics")
+            # Optional dataset content (cam0, cam1_left, action, is_lost and the
+            # per-episode depth_camera / tags are always kept). Right image and
+            # IMU only exist on OAK-D episodes: ticked, they are kept when EVERY
+            # episode has them, so a Gemini or mixed dataset loses no episode.
+            keep = gr.CheckboxGroup(
+                label="Dataset content",
+                choices=[(label, key) for key, label in CONTENT_OPTIONS.items()],
+                value=list(CONTENT_OPTIONS),
+                info="Optional streams to keep. Right image and IMU are added only "
+                     "when every episode has them (OAK-D).")
             # Read-only recap of the inputs, shown in their place while running.
             selection_card = gr.HTML(visible=False)
             # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
@@ -144,10 +155,10 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
                confirm_branch_btn, retry_btn,
                run_btn, pause_btn, cancel_btn, confirm_cancel_btn, keep_btn, reset_btn,
                source, target, task, selection_card]
-    run_event = run_btn.click(run_pipeline, inputs=[source, target, task, debug_sync],
+    run_event = run_btn.click(run_pipeline, inputs=[source, target, task, debug_sync, keep],
                               outputs=outputs)
     branch_event = confirm_branch_btn.click(run_pipeline_branch,
-                                            inputs=[source, target, task, debug_sync],
+                                            inputs=[source, target, task, debug_sync, keep],
                                             outputs=outputs)
     retry_event = retry_btn.click(retry_push, inputs=[retry_state], outputs=outputs)
     reset_btn.click(reset, inputs=None, outputs=outputs)
@@ -216,6 +227,9 @@ class _ProcessReq(BaseModel):
     # relay; a caller too old to send it still gets the same behaviour by naming the
     # target repo with SLAM_CHECK_MARKER (or the legacy prefix).
     check_only: bool = False
+    # Optional dataset content to keep: any of CONTENT_OPTIONS' keys ("depth",
+    # "right", "imu"). Omitted → everything, so existing callers are unchanged.
+    keep: list[str] | None = None
 
 
 def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
@@ -226,7 +240,8 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                             run_sync: bool = False,
                             roles: list[str] | None = None,
                             keep_raw: bool = True,
-                            check_only: bool = False) -> None:
+                            check_only: bool = False,
+                            keep: list[str] | None = None) -> None:
     """Run the pipeline synchronously in a background thread.
 
     exclude_fail: drop episodes with trajectory verdict FAIL.
@@ -382,7 +397,8 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                     # original single-arm schema.
                     report_by_ep = {ep: rep for ep, rep in slam_results}
                     built = build_recordings(target_repo, task, ds_root, kept,
-                                             report_by_ep, roles=roles, log=log)
+                                             report_by_ep, roles=roles, log=log,
+                                             keep=keep)
                     n_built = len(built)
                     n, link, _mode = push_lerobot(target_repo, task, ds_root,
                                                   n_built, token=token, log=log,
@@ -427,6 +443,10 @@ async def api_process(req: _ProcessReq, authorization: str | None = Header(defau
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <hf_token>")
     token = authorization[len("Bearer "):].strip()
+    try:
+        content_kwargs(req.keep)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     job_id = uuid.uuid4().hex[:12]
     target_repo = req.target_repo.strip()
     # check_only is the explicit path, and the fleet now sends it: the device relay
@@ -448,7 +468,8 @@ async def api_process(req: _ProcessReq, authorization: str | None = Header(defau
               req.task.strip(), token),
         kwargs={"exclude_fail": req.exclude_fail, "exclude_bad": req.exclude_bad,
                 "private": req.private, "run_sync": req.run_sync, "roles": req.roles,
-                "keep_raw": req.keep_raw, "check_only": check_only},
+                "keep_raw": req.keep_raw, "check_only": check_only,
+                "keep": req.keep},
         daemon=True,
     )
     t.start()
