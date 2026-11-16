@@ -196,6 +196,17 @@ def _has_imu(episode_dir: Path) -> bool:
     return _load_imu(episode_dir) is not None
 
 
+def optional_streams_available(episode_dir: Path) -> dict[str, bool]:
+    """Which optional streams one (arm) episode has: {"depth", "right", "imu"}.
+    The same tests the builder applies, so a content summary computed from this
+    matches what build_dataset / build_dataset_multi actually write."""
+    return {
+        "depth": _load_depth_samples(episode_dir) is not None,
+        "right": _has_right(episode_dir),
+        "imu": _has_imu(episode_dir),
+    }
+
+
 def _load_imu(episode_dir: Path) -> dict | None:
     """dcam_imu.json → {kind: (ts_s (n,), values (n, dim))} on the host clock of
     the frames, or None when the episode has no IMU.

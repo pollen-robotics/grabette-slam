@@ -136,6 +136,18 @@ def run_recap(logs: list[str]) -> str:
     return "\n\n**Run recap**\n```\n" + "\n".join(keep) + "\n```"
 
 
+def content_recap(logs: list[str]) -> str:
+    """The "Dataset content" section of the final card: what was kept or left out
+    of the dataset and why, lifted from the `[content]` lines that
+    pipeline.build_recordings logs before the build. "" when there are none
+    (e.g. a push-only retry)."""
+    marker = "[content] "
+    items = [ln.strip()[len(marker):] for ln in logs if ln.strip().startswith(marker)]
+    if not items:
+        return ""
+    return "\n\n**Dataset content**\n" + "\n".join(f"- {i}" for i in items)
+
+
 def success_summary(target_repo: str, n: int, link: str | None, mode: str) -> str:
     """Final success card — same for a first-try push and a retried push."""
     ds_url = f"https://huggingface.co/datasets/{target_repo}"

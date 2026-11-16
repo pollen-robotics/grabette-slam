@@ -23,7 +23,16 @@ from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 
 import session
 from pipeline import build_lerobot, episode_label, push_lerobot
-from views import bar, btns, error_card, inputs_view, io, run_recap, success_summary
+from views import (
+    bar,
+    btns,
+    content_recap,
+    error_card,
+    inputs_view,
+    io,
+    run_recap,
+    success_summary,
+)
 
 # The cooperative control flags live on the caller's session (session.RunSession):
 #   stop           — abandon the run (Cancel confirmed)
@@ -453,7 +462,8 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
                 f"Push failed: {err}\n\nThe dataset is built and cached — click "
                 f"“Retry push” to push it again without re-running SLAM.")
             label = "push failed"
-            yield view(summary=msg + run_recap(logs), state="finished", retry=True)
+            yield view(summary=msg + content_recap(logs) + run_recap(logs),
+                       state="finished", retry=True)
         else:
             label = "failed"
             yield view(summary=error_card(f"Pipeline failed: {err}") + run_recap(logs),
@@ -465,7 +475,8 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
     mode = result.get("mode")
     logs.append(f"✅ Done — {n} episode(s).")
     frac, label = 1.0, "done"
-    yield view(summary=success_summary(target_repo, n, link, mode) + run_recap(logs),
+    yield view(summary=success_summary(target_repo, n, link, mode) + content_recap(logs)
+                       + run_recap(logs),
                state="finished")
 
 

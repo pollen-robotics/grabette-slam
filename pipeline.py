@@ -60,6 +60,82 @@ def content_kwargs(keep=None) -> dict:
     }
 
 
+# Log-line prefix of the dataset-content summary; views.content_recap lifts these
+# lines into the end-of-run card.
+CONTENT_LOG_PREFIX = "[content]"
+
+# Feature name and why a stream may be missing, per optional stream.
+_CONTENT_STREAMS = {
+    "depth": ("dcam_depth", "depth map"),
+    "right": ("dcam_r", "right image: OAK-D only"),
+    "imu": ("imu", "IMU: OAK-D only"),
+}
+
+
+def content_plan(arm_dirs, keep=None, unit="episode"):
+    """Decide the optional dataset content from what the episodes actually have,
+    and explain it.
+
+    arm_dirs: every per-arm episode dir that is about to be built.
+    keep: the user's choice (CONTENT_OPTIONS keys), None = everything.
+    unit: what one arm dir is called in the summary ("episode" / "arm recording").
+
+    Returns (builder kwargs, summary lines). The kwargs are explicit True/False
+    decisions, so the builder does exactly what the summary says:
+      - depth ticked → kept; episodes without one are skipped by the builder.
+      - right / IMU ticked → kept only when EVERY arm has it (a LeRobot schema is
+        the same for every episode), otherwise left out with the count.
+      - unticked → left out.
+    """
+    from grabette_postprocess.dataset import optional_streams_available
+    from grabette_postprocess.episode_files import depth_camera_model
+
+    wanted = content_kwargs(keep)
+    arm_dirs = [Path(d) for d in arm_dirs]
+    total = len(arm_dirs)
+    avail = [optional_streams_available(d) for d in arm_dirs]
+    count = {k: sum(a[k] for a in avail) for k in _CONTENT_STREAMS}
+    units = f"{unit}(s)"
+
+    decided = {}
+    lines = ["always kept: cam0, dcam (left), action"]
+    for key, (feature, why) in _CONTENT_STREAMS.items():
+        ticked = wanted[f"with_{key}"] is not False
+        n = count[key]
+        if not ticked:
+            decided[key] = False
+            lines.append(f"{feature}: not kept — unticked (available on {n}/{total} {units})")
+        elif key == "depth":
+            decided[key] = True
+            extra = (f" — {total - n}/{total} {units} without it will be skipped"
+                     if n < total else "")
+            lines.append(f"{feature}: kept{extra}")
+        elif total and n == total:
+            decided[key] = True
+            lines.append(f"{feature}: kept ({n}/{total} {units})")
+        else:
+            decided[key] = False
+            lines.append(f"{feature}: not kept — only on {n}/{total} {units} ({why})"
+                         if n else f"{feature}: not kept — no {unit} has it ({why})")
+
+    cameras: dict[str, int] = {}
+    for d in arm_dirs:
+        model = depth_camera_model(d)
+        cameras[model] = cameras.get(model, 0) + 1
+    lines.append("depth cameras: " + ", ".join(
+        f"{m} ×{c}" for m, c in sorted(cameras.items())))
+
+    kwargs = {"with_depth": decided["depth"], "with_right": decided["right"],
+              "with_imu": decided["imu"]}
+    return kwargs, lines
+
+
+def _log_content(lines, log) -> None:
+    log("Dataset content:")
+    for ln in lines:
+        log(f"  {CONTENT_LOG_PREFIX} {ln}")
+
+
 def _check_sync(episode_dir):
     """Thin adapter: run check_dcam_imu and normalise to {verdict, message}."""
     result = check_dcam_imu(episode_dir)
@@ -154,11 +230,13 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
     from grabette_postprocess.checks.tags import episode_tags
     from grabette_postprocess.dataset import build_dataset, build_dataset_multi
 
-    content = content_kwargs(keep)
+    content_kwargs(keep)  # validate before any work
     roles = sorted(roles) if roles else detect_roles(episodes)
     if not roles:
         tags_by_recording = {ep.name: episode_tags(ep, report_by_ep.get(ep))
                              for ep in episodes}
+        content, lines = content_plan(episodes, keep, unit="episode")
+        _log_content(lines, log)
         log(f"Building LeRobot dataset from {len(episodes)} episode(s)…")
         build_dataset(repo_id=target_repo, episode_dirs=episodes, task=task,
                       root=Path(root), source_user=source_user,
@@ -185,6 +263,10 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
                 for t in episode_tags(group[role], report_by_ep.get(group[role]))]
         for ep_id, group in groups.items()
     }
+    content, lines = content_plan(
+        [group[r] for group in groups.values() for r in roles], keep,
+        unit="arm recording")
+    _log_content(lines, log)
     log(f"Building LeRobot dataset ({'+'.join(roles)}) from "
         f"{len(groups)} recording(s)…")
     build_dataset_multi(repo_id=target_repo, groups=groups, roles=roles, task=task,
