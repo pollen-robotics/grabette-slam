@@ -41,14 +41,15 @@ class RunSession:
         self.stop = threading.Event()
         self.pause = threading.Event()
         self.cancel_pending = threading.Event()
-        # A run has two sequential review gates — pre-SLAM (kind "input":
-        # completeness + sync) and post-SLAM (kind "trajectory") — so the same
-        # fields are reused twice; `review_kind` tells the panel which gate it is
-        # currently drawing.
+        # A run has three sequential review gates — pre-SLAM (kind "input":
+        # completeness + sync), post-SLAM (kind "trajectory") and, before the
+        # build, missing features (kind "content") — so the same fields are
+        # reused; `review_kind` tells the panel which gate it is drawing.
         self.review = threading.Event()       # worker is awaiting the user's decision
         self.review_done = threading.Event()  # Continue clicked → release the worker
         self.review_items: list[dict] = []    # flagged episodes published for the panel
         self.review_drop: list[str] = []      # episode names the user chose to drop
+        self.review_choices: dict[str, str] = {}  # content gate: feature → drop/exclude
         self.review_kind = "trajectory"
         self.seen = time.monotonic()
 
@@ -58,13 +59,15 @@ class RunSession:
         return {"open": self.review.is_set(),
                 "kind": self.review_kind,
                 "items": list(self.review_items),
-                "dropped": list(self.review_drop)}
+                "dropped": list(self.review_drop),
+                "choices": dict(self.review_choices)}
 
     def reset_review(self) -> None:
         """Clear every review flag (called by the controller's run reset)."""
         self.review.clear()
         self.review_done.clear()
         self.review_drop.clear()
+        self.review_choices.clear()
         self.review_kind = "trajectory"
 
     # ---- control flags --------------------------------------------------

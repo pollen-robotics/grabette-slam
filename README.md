@@ -20,11 +20,14 @@ A HuggingFace Space that turns a raw Grabette recording dataset into a
 1. **Sign in** with your Hugging Face account (OAuth).
 2. Give a **source** dataset `repo_id` (raw Grabette recording on the Hub), a
    **target** `repo_id` to create, and a task description.
-   Under **Dataset content**, untick the optional streams you don't want: the
-   depth map, the right image and the IMU. The right image and the IMU only
-   exist on OAK-D episodes, and are kept only when every episode has them.
-   The REST API takes the same choice as `keep` (`["depth", "right", "imu"]`,
-   all of them when omitted).
+   Under **Dataset content**, tick the optional streams to keep: the depth map,
+   the right image and the IMU (the last two exist on OAK-D episodes only). If
+   some episodes lack a ticked stream, the run stops before the build and asks,
+   for each such stream: add it and leave those episodes out, or don't add it.
+   The REST API takes the same choice as `keep` (e.g. `["depth", "imu"]`); with
+   no one to ask, a ticked stream leaves out the episodes without it. When `keep`
+   is omitted, the depth map is kept and the right image / IMU only when every
+   episode has them.
 3. For each episode the Space runs, in-process:
    - `convert_episode` — expand the recording into the `slam_input/` layout
    - `run_slam` — RGB-D odometry (visual-inertial when the camera has an IMU) via

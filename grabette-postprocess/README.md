@@ -175,11 +175,12 @@ with `ds.meta.episodes[i]["depth_camera"]`. The model comes from `metadata.json`
 else from `dcam_calib.json`, else from the OAK-only streams (IMU, right image).
 
 **OAK-D-only streams.** Only the OAK-D SR records a right image and an IMU; the
-Gemini 305 has neither. A LeRobot schema is the same for every episode, so by
-default `dcam_r` and `imu` are added only when **every** episode has them. A
-dataset mixing OAK-D and Gemini episodes keeps all its episodes and leaves both
-out. `build_dataset(..., with_right=True, with_imu=True)` forces them in and
-skips the episodes without them; `False` leaves them out.
+Gemini 305 has neither. A LeRobot schema is the same for every episode, so
+`build_dataset(..., with_right=True, with_imu=True)` keeps them and skips the
+episodes without them, `False` leaves them out, and `None` (the builder's
+default) adds them only when **every** episode has them. The Space and the
+fleet pass an explicit choice: a ticked stream is kept, its missing episodes
+skipped.
 
 **IMU.** The ~200 Hz streams are resampled onto the dataset frames: accel (m/s²)
 and gyro (rad/s) are linearly interpolated, and the fused rotation (IMU body to

@@ -388,6 +388,34 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
         return _review_gate("trajectory", items,
                             [(episode_label(ep), ep) for ep, _ in results])
 
+    def content_review_cb(gaps):
+        """Called by build_lerobot before the build when ticked features are missing
+        from some kept episodes (pipeline.content_gaps). Publishes one item per
+        feature on THIS session's panel (kind "content") and blocks until the user
+        has chosen, for each, "exclude" (keep it, leave out those episodes) or "drop"
+        (don't add it). Returns {key: choice}. A feature no episode has can only be
+        dropped: when that's all there is, nothing to ask — the run goes on."""
+        items = [{"key": g["key"], "label": g["label"], "total": g["total"],
+                  "missing": [name for name, _ in g["missing"]],
+                  "forced": len(g["missing"]) == g["total"]}
+                 for g in gaps]
+        if all(it["forced"] for it in items):
+            return {}
+        print(f"⏸ Content review: {len(items)} selected feature(s) missing from some "
+              f"episodes — choose, for each, then click Continue.")
+        sess.review_kind = "content"
+        sess.review_items[:] = items
+        sess.review_choices.clear()
+        sess.review_drop.clear()
+        sess.review_done.clear()
+        sess.review.set()
+        while not sess.review_done.is_set():
+            if sess.stop.is_set():
+                break
+            time.sleep(0.2)
+        sess.review.clear()
+        return dict(sess.review_choices)
+
     def worker():
         writer = _LineQueueWriter(q)
         try:
@@ -416,7 +444,7 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
                     log=print, should_stop=sess.stop.is_set, to_branch=to_branch,
                     on_progress=on_progress, token=token, gate=sess.wait_if_paused,
                     pre_review=pre_review_cb, review=review_cb, run_sync=run_sync,
-                    keep=list(keep or []))
+                    keep=list(keep or []), content_review=content_review_cb)
                 # Build done — dataset cached on disk; record it so that if the push
                 # fails, the "Retry push" button can reuse it (no re-running SLAM).
                 result["built"] = {"root": str(ds_root), "n": len(built)}

@@ -87,16 +87,16 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
             debug_sync = gr.Checkbox(
                 label="Run sync checks (debug)", value=False,
                 info="Extra camera↔IMU / image↔trajectory timing diagnostics")
-            # Optional dataset content (cam0, dcam, action, is_lost and the
-            # per-episode depth_camera / tags are always kept). Right image and
-            # IMU only exist on OAK-D episodes: ticked, they are kept when EVERY
-            # episode has them, so a Gemini or mixed dataset loses no episode.
+            # Optional dataset content. If some episodes lack a ticked stream, the
+            # run asks before the build (content review): add it and leave those
+            # episodes out, or don't add it.
             keep = gr.CheckboxGroup(
                 label="Dataset content", elem_id="content-keep",
                 choices=[(label, key) for key, label in CONTENT_OPTIONS.items()],
                 value=list(CONTENT_OPTIONS),
-                info="Optional streams to keep. Right image and IMU are added only "
-                     "when every episode has them (OAK-D).")
+                info="If some episodes lack a ticked stream, you'll choose before the "
+                     "build: add it (leaving them out) or not. Right image and IMU "
+                     "exist on OAK-D episodes only.")
             # Read-only recap of the inputs, shown in their place while running.
             selection_card = gr.HTML(visible=False)
             # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
