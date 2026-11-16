@@ -28,11 +28,11 @@ BINARY = os.environ.get("VSLAM_BINARY", "/usr/local/bin/offline_vslam")
 _PUSH_LOCK = threading.Lock()
 
 # Optional dataset content the user can choose to keep (UI checkboxes, REST
-# `keep`). Everything else (cam0, cam1_left, action, is_lost, depth_camera, tags)
+# `keep`). Everything else (cam0, dcam, action, is_lost, depth_camera, tags)
 # is always written. key -> UI label.
 CONTENT_OPTIONS = {
-    "depth": "Depth map (cam1_depth)",
-    "right": "Right image (cam1_right, OAK-D only)",
+    "depth": "Depth map (dcam_depth)",
+    "right": "Right image (dcam_r, OAK-D only)",
     "imu": "IMU (OAK-D only)",
 }
 
@@ -141,9 +141,9 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
         detect_roles.
 
     With roles → ONE uniform, role-prefixed schema for any arm count (mono is the
-    single-role case: left_cam0/left_cam1_left + 8D left action; bimanual adds the
+    single-role case: left_cam0/left_dcam + 8D left action; bimanual adds the
     right block), built from the per-arm dirs paired back into synchronized
-    recordings. Without → the legacy flat single-arm schema (cam0/cam1_left, 8D).
+    recordings. Without → the legacy flat single-arm schema (cam0/dcam, 8D).
 
     keep: optional content to keep (CONTENT_OPTIONS keys, see content_kwargs);
         None keeps everything.

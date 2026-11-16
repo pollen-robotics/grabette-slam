@@ -25,7 +25,7 @@ from grabette_postprocess.checks.tags import episode_tags
 @click.option("--root", type=click.Path(), default=None,
               help="Local storage path (default: HF cache)")
 @click.option("--depth/--no-depth", default=True, show_default=True,
-              help="Include the depth map (observation.images.cam1_depth, 12-bit "
+              help="Include the depth map (observation.images.dcam_depth, 12-bit "
                    "log-quantized HEVC; see dataset.DEPTH_QUANTIZATION)")
 def main(input_dir, repo_id, task, fps, image_height, image_width, root, depth):
     input_dir = Path(input_dir).expanduser().absolute()

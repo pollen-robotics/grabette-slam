@@ -34,7 +34,7 @@ Episode directory (from Grabette)
 LeRobot v3 dataset/
 ├── meta/info.json, stats.json, tasks.parquet, episodes/
 ├── data/chunk-NNN/file-NNN.parquet
-└── videos/observation.images.{cam0,cam1_left,cam1_right,cam1_depth}/chunk-NNN/file-NNN.mp4
+└── videos/observation.images.{cam0,dcam,dcam_r,dcam_depth}/chunk-NNN/file-NNN.mp4
 ```
 
 ## Setup
@@ -162,9 +162,9 @@ uv run python scripts/pipeline/generate_dataset.py \
 | Feature | dtype | shape | Source |
 |---------|-------|-------|--------|
 | `observation.images.cam0` | video | (3, 720, 960) | RPi fisheye, `raw_video.mp4` (resized) |
-| `observation.images.cam1_left` | video | (3, 720, 960) | depth camera left image, `dcam_left.mp4` (resized) |
-| `observation.images.cam1_right` | video | (3, 720, 960) | depth camera right image, `dcam_right.mp4` (resized). OAK-D only, see below |
-| `observation.images.cam1_depth` | video (depth) | (1, 400, 640) | depth map, `dcam_depth.mkv`, native resolution |
+| `observation.images.dcam` | video | (3, 720, 960) | depth camera left image, `dcam_left.mp4` (resized) |
+| `observation.images.dcam_r` | video | (3, 720, 960) | depth camera right image, `dcam_right.mp4` (resized). OAK-D only, see below |
+| `observation.images.dcam_depth` | video (depth) | (1, 400, 640) | depth map, `dcam_depth.mkv`, native resolution |
 | `action` | float32 | (8,) | `[x, y, z, ax, ay, az, proximal, distal]`, next-step target |
 | `is_lost` | float32 | (1,) | SLAM tracking-lost flag (1.0 = lost), for masking |
 | `imu` | float32 | (10,) | `[ax, ay, az, wx, wy, wz, qx, qy, qz, qw]` from `dcam_imu.json`. OAK-D only, see below |
@@ -176,7 +176,7 @@ else from `dcam_calib.json`, else from the OAK-only streams (IMU, right image).
 
 **OAK-D-only streams.** Only the OAK-D SR records a right image and an IMU; the
 Gemini 305 has neither. A LeRobot schema is the same for every episode, so by
-default `cam1_right` and `imu` are added only when **every** episode has them. A
+default `dcam_r` and `imu` are added only when **every** episode has them. A
 dataset mixing OAK-D and Gemini episodes keeps all its episodes and leaves both
 out. `build_dataset(..., with_right=True, with_imu=True)` forces them in and
 skips the episodes without them; `False` leaves them out.
@@ -193,8 +193,8 @@ gravity-aligned (Z-up). The pose component is position + axis-angle rotation;
 the gripper component is the two joint angles.
 
 Bimanual / role-partitioned recordings (`<recording>/{left,right}/`) use the
-same features prefixed by role: `left_cam0`, `left_cam1_left`, `left_cam1_right`,
-`left_cam1_depth`, `right_…`, with `action` (8 per arm), `is_lost` (1 per arm)
+same features prefixed by role: `left_cam0`, `left_dcam`, `left_dcam_r`,
+`left_dcam_depth`, `right_…`, with `action` (8 per arm), `is_lost` (1 per arm)
 and `imu` (10 per arm) concatenated in role order, and a `{role}_depth_camera`
 column per arm in the episodes metadata.
 
@@ -206,8 +206,8 @@ Each uint16 mm frame is quantized to a 12-bit code and encoded losslessly as
 HEVC `gray12le` in an MP4. LeRobot decodes it back to depth on load, in mm by
 default or in m with `depth_output_unit="m"`.
 
-- **Alignment:** pixel-registered to the depth camera's left sensor (`cam1_left`),
-  in the same orientation. `cam1_left` itself is resized to 960×720, so scale pixel
+- **Alignment:** pixel-registered to the depth camera's left sensor (`dcam`),
+  in the same orientation. `dcam` itself is resized to 960×720, so scale pixel
   coordinates between the two.
 - **Quantization** (`DEPTH_QUANTIZATION` in `grabette_postprocess/dataset.py`)
   is tuned for grabette's close range instead of LeRobot's generic 0.01–10 m.
@@ -238,7 +238,7 @@ from pathlib import Path
 from lerobot.datasets import LeRobotDataset
 
 ds = LeRobotDataset("user/dataset-name", root=Path("~/lerobot_datasets").expanduser())
-depth_mm = ds[0]["observation.images.cam1_depth"]   # torch.float32 (1, 400, 640), mm
+depth_mm = ds[0]["observation.images.dcam_depth"]   # torch.float32 (1, 400, 640), mm
 valid = depth_mm > 70.0
 ```
 

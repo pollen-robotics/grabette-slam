@@ -87,7 +87,7 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
             debug_sync = gr.Checkbox(
                 label="Run sync checks (debug)", value=False,
                 info="Extra camera↔IMU / image↔trajectory timing diagnostics")
-            # Optional dataset content (cam0, cam1_left, action, is_lost and the
+            # Optional dataset content (cam0, dcam, action, is_lost and the
             # per-episode depth_camera / tags are always kept). Right image and
             # IMU only exist on OAK-D episodes: ticked, they are kept when EVERY
             # episode has them, so a Gemini or mixed dataset loses no episode.

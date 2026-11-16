@@ -66,9 +66,9 @@ def test_build_dataset_roundtrip(tmp_path):
 
     feats = ds.meta.features
     assert feats["observation.images.cam0"]["dtype"] == "video"
-    assert feats["observation.images.cam1_left"]["dtype"] == "video"
+    assert feats["observation.images.dcam"]["dtype"] == "video"
     # an episode without right image / IMU → neither in the schema
-    assert "observation.images.cam1_right" not in feats
+    assert "observation.images.dcam_r" not in feats
     assert "imu" not in feats
     assert tuple(feats["action"]["shape"]) == (8,)
     assert "is_lost" in feats
@@ -164,8 +164,8 @@ def test_build_dataset_depth_roundtrip(tmp_path, legacy_png):
     from lerobot.datasets import LeRobotDataset
     ds = LeRobotDataset(repo_id, root=root)
     assert ds.meta.total_frames == N
-    assert ds.meta.depth_keys == ["observation.images.cam1_depth"]
-    _assert_depth_roundtrip(ds, "observation.images.cam1_depth")
+    assert ds.meta.depth_keys == ["observation.images.dcam_depth"]
+    _assert_depth_roundtrip(ds, "observation.images.dcam_depth")
 
 
 def test_build_dataset_skips_episode_without_depth(tmp_path):
@@ -192,8 +192,8 @@ def test_build_dataset_multi_depth(tmp_path):
 
     from lerobot.datasets import LeRobotDataset
     ds = LeRobotDataset("test/grabette_depth_multi", root=root)
-    assert sorted(ds.meta.depth_keys) == ["observation.images.left_cam1_depth",
-                                          "observation.images.right_cam1_depth"]
+    assert sorted(ds.meta.depth_keys) == ["observation.images.left_dcam_depth",
+                                          "observation.images.right_dcam_depth"]
     for key in ds.meta.depth_keys:
         _assert_depth_roundtrip(ds, key)
 
@@ -235,8 +235,8 @@ def test_build_dataset_right_and_imu(tmp_path):
     from grabette_postprocess.dataset import IMU_NAMES
     ds = LeRobotDataset("test/grabette_oakd", root=root)
     feats = ds.meta.features
-    assert feats["observation.images.cam1_right"]["shape"] == feats[
-        "observation.images.cam1_left"]["shape"]
+    assert feats["observation.images.dcam_r"]["shape"] == feats[
+        "observation.images.dcam"]["shape"]
     assert list(feats["imu"]["names"]) == IMU_NAMES
     assert ds.meta.total_frames == N
 
@@ -261,7 +261,7 @@ def test_build_dataset_mixed_cameras_drops_optional_streams(tmp_path):
     from lerobot.datasets import LeRobotDataset
     ds = LeRobotDataset("test/grabette_mixed", root=root)
     assert ds.meta.total_episodes == 2
-    assert "observation.images.cam1_right" not in ds.meta.features
+    assert "observation.images.dcam_r" not in ds.meta.features
     assert "imu" not in ds.meta.features
     assert [ds.meta.episodes[i]["depth_camera"] for i in range(2)] == ["oakd", "gemini305"]
 
@@ -280,7 +280,7 @@ def test_build_dataset_multi_right_imu_camera(tmp_path):
     ds = LeRobotDataset("test/grabette_multi_oakd", root=root)
     feats = ds.meta.features
     for r in ("left", "right"):
-        for cam in ("cam0", "cam1_left", "cam1_right"):
+        for cam in ("cam0", "dcam", "dcam_r"):
             assert f"observation.images.{r}_{cam}" in feats
         assert ds.meta.episodes[0][f"{r}_depth_camera"] == "oakd"
     assert tuple(feats["imu"]["shape"]) == (20,)

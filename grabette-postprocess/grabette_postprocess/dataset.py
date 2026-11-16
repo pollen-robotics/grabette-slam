@@ -3,16 +3,16 @@
 Converts trajectory + capture data into LeRobot v3 format (Parquet + MP4).
 Camera observations, all selected nearest-by-timestamp against the trajectory:
   - cam0: RPi fisheye (raw_video.mp4)
-  - cam1_left: depth camera left image (dcam_left.mp4)
-  - cam1_right: depth camera right image (dcam_right.mp4) — OAK-D only, the
-    Gemini 305 records no right image; built exactly like cam1_left.
-  - cam1_depth (unless disabled): the depth map (dcam_depth.mkv, uint16 mm),
-    pixel-registered to cam1_left's sensor, stored as a LeRobot depth stream
+  - dcam: depth camera left image (dcam_left.mp4)
+  - dcam_r: depth camera right image (dcam_right.mp4) — OAK-D only, the
+    Gemini 305 records no right image; built exactly like dcam.
+  - dcam_depth (unless disabled): the depth map (dcam_depth.mkv, uint16 mm),
+    pixel-registered to dcam's sensor, stored as a LeRobot depth stream
     (see DEPTH_QUANTIZATION).
 Plus `imu` (accel, gyro, fused rotation; OAK-D only) resampled onto the frames,
 and a per-episode `depth_camera` model column in the episodes metadata.
 
-A LeRobot schema is the same for every episode, so cam1_right / imu are added
+A LeRobot schema is the same for every episode, so dcam_r / imu are added
 only when every episode has them (see _optional_stream_policy).
 """
 
@@ -42,7 +42,7 @@ FEATURES_BASE = {
         "shape": (3, 720, 960),  # C, H, W — LeRobot convention
         "names": ["channels", "height", "width"],
     },
-    "observation.images.cam1_left": {
+    "observation.images.dcam": {
         "dtype": "video",
         "shape": (3, 720, 960),  # depth camera left, resized to image_size like cam0
         "names": ["channels", "height", "width"],
@@ -94,6 +94,12 @@ DEPTH_QUANTIZATION = {
 # Orbbec Gemini 305). Kept native — resizing depth would interpolate across edges.
 DEPTH_SIZE = (400, 640)  # (H, W)
 
+
+# Depth-camera sensor side (dcam_{side}.mp4) -> feature name. The left image is
+# THE depth-camera image (SLAM input, depth registered to it), hence plain
+# "dcam"; the optional right one is "dcam_r". Kept short of "left"/"right" so a
+# role-prefixed key never reads like "left_..._left" (arm vs. sensor side).
+DCAM_KEYS = {"left": "dcam", "right": "dcam_r"}
 
 # --- IMU -----------------------------------------------------------------------
 # One row per dataset frame, resampled from the ~200 Hz dcam_imu.json streams:
@@ -249,7 +255,7 @@ def _imu_at(imu: dict, query_ts: np.ndarray) -> np.ndarray:
 
 
 def _optional_stream_policy(name: str, wanted: bool | None, present: list[bool]) -> bool:
-    """Whether to add an optional per-arm stream (cam1_right, imu) to the schema.
+    """Whether to add an optional per-arm stream (dcam_r, imu) to the schema.
 
     wanted=None (auto): only when EVERY episode has it — a LeRobot schema is
     uniform, and dropping the episodes that lack it (e.g. every Gemini episode
@@ -408,12 +414,12 @@ def build_dataset(
             dir name (flat layout). Pass e.g. `lambda d: d.parent.name` when the
             raw dataset is role-partitioned ({episode_id}/{role}), so episodes
             key by episode_id instead of the (colliding) role.
-        with_depth: add `observation.images.cam1_depth` (depth map registered
-            to cam1_left, uint16 mm, quantized per DEPTH_QUANTIZATION). Episodes
+        with_depth: add `observation.images.dcam_depth` (depth map registered
+            to dcam, uint16 mm, quantized per DEPTH_QUANTIZATION). Episodes
             without depth are then skipped, since the schema must be uniform.
         depth_size: (height, width) of the stored depth maps (native by default).
-        with_right: add `observation.images.cam1_right` (dcam_right.mp4, built
-            like cam1_left). None = only when every episode has it; True = always,
+        with_right: add `observation.images.dcam_r` (dcam_right.mp4, built
+            like dcam). None = only when every episode has it; True = always,
             skipping episodes without it; False = never.
         with_imu: add `imu` (see IMU_NAMES), same None/True/False rule.
 
@@ -432,7 +438,7 @@ def build_dataset(
         print(f"Using default fps: {int(fps)}")
 
     with_right = _optional_stream_policy(
-        "cam1_right", with_right, [_has_right(d) for d in episode_dirs])
+        "dcam_r", with_right, [_has_right(d) for d in episode_dirs])
     with_imu = _optional_stream_policy(
         "imu", with_imu, [_has_imu(d) for d in episode_dirs])
 
@@ -441,11 +447,11 @@ def build_dataset(
     h, w = image_size
     rgb_feature = {**features["observation.images.cam0"], "shape": (3, h, w)}
     features["observation.images.cam0"] = rgb_feature
-    features["observation.images.cam1_left"] = rgb_feature
+    features["observation.images.dcam"] = rgb_feature
     if with_right:
-        features["observation.images.cam1_right"] = rgb_feature
+        features["observation.images.dcam_r"] = rgb_feature
     if with_depth:
-        features["observation.images.cam1_depth"] = _depth_feature(depth_size)
+        features["observation.images.dcam_depth"] = _depth_feature(depth_size)
     if with_imu:
         features["imu"] = {"dtype": "float32", "shape": (len(IMU_NAMES),),
                            "names": list(IMU_NAMES)}
@@ -509,7 +515,7 @@ def build_dataset(
         cam0_cache = _load_video_frames_indexed(video_path, image_size,
                                                 set(cam0_indices.tolist()))
 
-        # --- cam1_left / cam1_right: depth-camera images, same selection ---
+        # --- dcam / dcam_r: depth-camera images, same selection ---
         sides = ["left", "right"] if with_right else ["left"]
         dcam_indices, dcam_caches = {}, {}
         for side in sides:
@@ -547,10 +553,10 @@ def build_dataset(
                 "is_lost": np.array([is_lost[i]], dtype=np.float32),
             }
             for s in sides:
-                frame[f"observation.images.cam1_{s}"] = cv2.cvtColor(dcam_imgs[s],
-                                                                     cv2.COLOR_BGR2RGB)
+                frame[f"observation.images.{DCAM_KEYS[s]}"] = cv2.cvtColor(
+                    dcam_imgs[s], cv2.COLOR_BGR2RGB)
             if with_depth:
-                frame["observation.images.cam1_depth"] = depth  # uint16 mm
+                frame["observation.images.dcam_depth"] = depth  # uint16 mm
             if with_imu:
                 frame["imu"] = imu_rows[i]
             dataset.add_frame(frame)
@@ -600,7 +606,7 @@ def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int],
                       with_depth: bool = False, with_right: bool = False,
                       with_imu: bool = False) -> dict:
     """Load one arm's SLAM trajectory + 8D actions + is_lost + per-video
-    timestamps (cam0 RPi fisheye, cam1_left depth-camera left, plus cam1_right,
+    timestamps (cam0 RPi fisheye, dcam depth-camera left, plus dcam_r,
     the depth map and the IMU when asked) for nearest-ts frame selection, plus
     its capture_started clock and depth-camera model.
     Raises if the trajectory or a requested stream is missing (a valid grabette
@@ -656,12 +662,12 @@ def build_dataset_multi(
 ):
     """Build a LeRobot v3 dataset with a uniform, role-prefixed schema for ONE OR
     MORE arms (roles). Mono is just the single-role case of this: a lone left
-    grabette yields observation.images.left_cam0/left_cam1_left + action
+    grabette yields observation.images.left_cam0/left_dcam + action
     [left_x…] (8D), exactly the left block of a bimanual episode — so mono and
     bimanual share one format, differing only in how many arms are present.
 
-    Per role: observation.images.{role}_cam0 (RPi fisheye) + {role}_cam1_left
-    (depth camera left), plus {role}_cam1_right / {role}_cam1_depth when enabled
+    Per role: observation.images.{role}_cam0 (RPi fisheye) + {role}_dcam
+    (depth camera left), plus {role}_dcam_r / {role}_dcam_depth when enabled
     (see build_dataset); `action` is the per-role 8D absolute states concatenated
     (in `roles` order); `is_lost` is per-role, and so is `imu` (10 per role) when
     enabled. with_right / with_imu: None = only when every arm of every recording
@@ -683,20 +689,20 @@ def build_dataset_multi(
 
     arm_dirs = [Path(g[r]) for g in groups.values() for r in roles if r in g]
     with_right = _optional_stream_policy(
-        "cam1_right", with_right, [_has_right(d) for d in arm_dirs])
+        "dcam_r", with_right, [_has_right(d) for d in arm_dirs])
     with_imu = _optional_stream_policy(
         "imu", with_imu, [_has_imu(d) for d in arm_dirs])
     sides = ("left", "right") if with_right else ("left",)
 
     features: dict = {}
     for role in roles:
-        for cam in ("cam0", *(f"cam1_{s}" for s in sides)):
+        for cam in ("cam0", *(DCAM_KEYS[s] for s in sides)):
             features[f"observation.images.{role}_{cam}"] = {
                 "dtype": "video", "shape": (3, h, w),
                 "names": ["channels", "height", "width"],
             }
         if with_depth:
-            features[f"observation.images.{role}_cam1_depth"] = _depth_feature(depth_size)
+            features[f"observation.images.{role}_dcam_depth"] = _depth_feature(depth_size)
     per =["x", "y", "z", "ax", "ay", "az", "proximal", "distal"]
     features["action"] = {
         "dtype": "float32", "shape": (8 * len(roles),),
@@ -783,11 +789,11 @@ def build_dataset_multi(
             for side in sides:
                 path, ts = a["dcam"][side]
                 idx = _nearest_frame_indices(q, ts)
-                streams[f"cam1_{side}"] = (idx, _load_video_frames_indexed(
+                streams[DCAM_KEYS[side]] = (idx, _load_video_frames_indexed(
                     path, image_size, set(idx.tolist())))
             if with_depth:
                 idx = _nearest_frame_indices(q, a["depth_ts"])
-                streams["cam1_depth"] = (idx, _load_depth_frames_indexed(
+                streams["dcam_depth"] = (idx, _load_depth_frames_indexed(
                     a["dir"], a["depth_samples"], depth_size, set(idx.tolist())))
             per_role[r] = streams
             if with_imu:
@@ -805,7 +811,7 @@ def build_dataset_multi(
                         ok = False
                         break
                     frame[f"observation.images.{r}_{name}"] = (
-                        img if name == "cam1_depth"  # uint16 mm
+                        img if name == "dcam_depth"  # uint16 mm
                         else cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 if not ok:
                     break
