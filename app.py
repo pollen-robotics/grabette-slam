@@ -92,7 +92,7 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
             # IMU only exist on OAK-D episodes: ticked, they are kept when EVERY
             # episode has them, so a Gemini or mixed dataset loses no episode.
             keep = gr.CheckboxGroup(
-                label="Dataset content",
+                label="Dataset content", elem_id="content-keep",
                 choices=[(label, key) for key, label in CONTENT_OPTIONS.items()],
                 value=list(CONTENT_OPTIONS),
                 info="Optional streams to keep. Right image and IMU are added only "

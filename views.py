@@ -340,6 +340,13 @@ CSS = """
 #logbox textarea {font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
                   font-size: 12px; line-height: 1.35;}
 footer {display: none !important;}
+/* The page is as wide as its widest content, and the input/output columns only
+   sit side by side once that is wide enough — otherwise they stack and the form
+   is centred. The "Dataset content" chips + info line are wide enough on one line
+   to flip that, pushing the form to the left of an empty output column. Taking
+   the group out of the intrinsic-width computation keeps the original layout:
+   it now wraps to the column's width instead of setting it. */
+#content-keep {contain: inline-size;}
 /* Episode-review actions: orange to match the flagged-episode cards (warning),
    not the default emerald primary.
    Both `.btn-x` and `.btn-x button` are targeted because Gradio 6 puts
