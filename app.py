@@ -40,6 +40,7 @@ from controller import (
     keep_running,
     request_cancel,
     reset,
+    run_ready,
     retry_push,
     run_pipeline,
     run_pipeline_branch,
@@ -77,11 +78,11 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
         # ---- Inputs (left) ----
         with gr.Column(scale=2, min_width=280):
             gr.LoginButton(size="sm")
-            source = gr.Textbox(label="Source dataset", info="raw Grabette repo on the Hub",
+            source = gr.Textbox(label="Source dataset *", info="raw Grabette repo on the Hub",
                                 placeholder="pollen-robotics/grabette-raw")
-            target = gr.Textbox(label="Target dataset", info="repo to create or contribute to",
+            target = gr.Textbox(label="Target dataset *", info="repo to create or contribute to",
                                 placeholder="your-account/grabette-dataset")
-            task = gr.Textbox(label="Task description", placeholder="cup grasping")
+            task = gr.Textbox(label="Task description *", placeholder="cup grasping")
             # Sync checks (depth-cam↔gyro pre-SLAM, image↔trajectory post-SLAM) are a
             # debug-only diagnostic — off by default so a normal run skips them.
             debug_sync = gr.Checkbox(
@@ -101,7 +102,9 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
             # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
             # Finished: only Reset. All visibility is driven by the generators.
             with gr.Row():
-                run_btn = gr.Button("▶  Run", variant="primary", scale=2)
+                # Greyed until the required (*) fields are filled (see run_ready).
+                run_btn = gr.Button("▶  Run", variant="primary", scale=2,
+                                    interactive=False)
                 pause_btn = gr.Button("⏸  Pause", variant="secondary",
                                       scale=1, visible=False)
                 cancel_btn = gr.Button("✕  Cancel", variant="stop",
@@ -160,7 +163,12 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
                                             inputs=[source, target, task, debug_sync, keep],
                                             outputs=outputs)
     retry_event = retry_btn.click(retry_push, inputs=[retry_state], outputs=outputs)
-    reset_btn.click(reset, inputs=None, outputs=outputs)
+    reset_btn.click(reset, inputs=[source, target, task], outputs=outputs)
+    # Required fields: Run follows them as they're edited. Only fires on the idle
+    # page — while running the fields are hidden, so they can't change.
+    for _fld in (source, target, task):
+        _fld.change(run_ready, inputs=[source, target, task], outputs=run_btn,
+                    show_progress="hidden")
     # Pause/Resume + cancel-confirm just flip cooperative flags; the running
     # generator re-renders the buttons from them on its next tick (outputs=None
     # → these never write the same components as the stream, so no conflict).
@@ -178,7 +186,7 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
     cancel_evt = confirm_cancel_btn.click(
         confirm_cancel, inputs=None, outputs=None,
         cancels=[run_event, branch_event, retry_event])
-    cancel_evt.then(reset, inputs=None, outputs=outputs)
+    cancel_evt.then(reset, inputs=[source, target, task], outputs=outputs)
 
 
 # ── REST API for grabette devices ────────────────────────────────────────────

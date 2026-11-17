@@ -29,6 +29,7 @@ from views import (
     content_recap,
     error_card,
     inputs_view,
+    required_filled,
     io,
     run_recap,
     success_summary,
@@ -187,7 +188,7 @@ def _preflight(api, source_repo, target_repo, scopes=frozenset()):
     return exists, writable, None
 
 
-def _reset_view(sess):
+def _reset_view(sess, ready=False):
     """Full reset to the idle page (clears log/summary/bar, only Run shown).
 
     Clears the UI-facing flags (pause, cancel-pending, review) but NOT stop: when
@@ -198,7 +199,7 @@ def _reset_view(sess):
     sess.pause.clear()
     sess.cancel_pending.clear()
     sess.reset_review()
-    return (*io("idle", bar(0, "ready"), ""), "", None, *btns("idle"),
+    return (*io("idle", bar(0, "ready"), ""), "", None, *btns("idle", ready=ready),
             *inputs_view("idle"))
 
 
@@ -613,7 +614,14 @@ def run_pipeline_branch(source_repo, target_repo, task, run_sync=False, keep=Non
                     to_branch=True, sess=session.get(request))
 
 
-def reset(request: gr.Request = None):
+def reset(source="", target="", task="", request: gr.Request = None):
     """Reset button (shown when finished): clear the page and return to idle
-    (only Run). Inputs (source/target/task) are kept so the user can re-run."""
-    return _reset_view(session.get(request))
+    (only Run). Inputs (source/target/task) are kept so the user can re-run, and
+    Run is clickable again only if they're all filled."""
+    return _reset_view(session.get(request),
+                       ready=required_filled(source, target, task))
+
+
+def run_ready(source, target, task):
+    """Typing in a required field: grey Run out until all three are filled."""
+    return gr.update(interactive=required_filled(source, target, task))

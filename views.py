@@ -185,14 +185,21 @@ def success_summary(target_repo: str, n: int, link: str | None, mode: str) -> st
     )
 
 
+def required_filled(source, target, task) -> bool:
+    """Source, target and task all filled (whitespace alone doesn't count, as the
+    run strips it): the condition for Run to be clickable."""
+    return all((v or "").strip() for v in (source, target, task))
+
+
 def btns(state, *, paused=False, cancel_pending=False,
-         branch=False, retry=False, allow_pause=True):
+         branch=False, retry=False, allow_pause=True, ready=True):
     """Updates for the 8 buttons, in `outputs` order:
     (branch, retry, run, pause, cancel, confirm_cancel, keep, reset).
 
     state: 'idle' (only Run, enabled), 'running' (Run greyed 'Running' + Pause +
     Cancel, or the confirm/keep pair when a cancel is pending), or 'finished'
-    (only Reset). retry reveals the retry button. branch=True is the "target already
+    (only Reset). In idle, ready=False greys Run (a required field is empty, see
+    required_filled). retry reveals the retry button. branch=True is the "target already
     exists" case: Run is replaced by the "Push to a new branch" button (primary) and
     Reset is offered so the user can edit the target instead.
     """
@@ -224,7 +231,7 @@ def btns(state, *, paused=False, cancel_pending=False,
             run_u = H
             reset_u = gr.update(visible=True)
         else:
-            run_u = gr.update(visible=True, interactive=True, value="▶  Run")
+            run_u = gr.update(visible=True, interactive=ready, value="▶  Run")
             reset_u = H
         pause_u = cancel_u = confirm_u = keep_u = H
     return (branch_u, retry_u, run_u, pause_u, cancel_u, confirm_u, keep_u, reset_u)
