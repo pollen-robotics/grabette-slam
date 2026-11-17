@@ -391,13 +391,11 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
                             [(episode_label(ep), ep) for ep, _ in results])
 
     def content_review_cb(gaps):
-        """Called by build_lerobot right after the pre-SLAM review when ticked
-        features are missing from some or all kept episodes (pipeline.content_gaps).
+        """Called by build_lerobot after the pre-SLAM review when ticked features
+        are missing from some or all kept episodes (pipeline.content_gaps).
         Publishes one item per feature on THIS session's panel (kind "content") and
         blocks until the user has chosen, for each, "exclude" (keep it, leave out
-        those episodes) or "drop" (don't add it). Returns {key: choice}. A feature
-        no episode has can only be dropped, but it is still shown — the user
-        continues knowing it won't be in the dataset."""
+        those episodes) or "drop" (don't add it). Returns {key: choice}."""
         items = [{"key": g["key"], "label": g["label"], "total": g["total"],
                   "missing": [name for name, _ in g["missing"]],
                   "forced": len(g["missing"]) == g["total"]}
@@ -615,15 +613,13 @@ def run_pipeline_branch(source_repo, target_repo, task, run_sync=False, keep=Non
 
 def reset(source="", target="", task="", request: gr.Request = None):
     """Reset button (shown when finished): clear the page and return to idle
-    (only Run). Inputs (source/target/task) are kept so the user can re-run, and
-    Run is clickable again only if they're all filled."""
+    (only Run). Inputs (source/target/task) are kept so the user can re-run."""
     return _reset_view(session.get(request),
                        ready=required_filled(source, target, task))
 
 
 def signed_in_view(profile: gr.OAuthProfile | None = None):
-    """Page load: signed out → only the big Sign-in button (+ hint); signed in →
-    the form, with the button back to a small secondary Logout."""
+    """Page load: show the form only when signed in."""
     on = profile is not None
     return (gr.update(size="sm" if on else "lg",
                       variant="secondary" if on else "primary"),
@@ -632,5 +628,5 @@ def signed_in_view(profile: gr.OAuthProfile | None = None):
 
 
 def run_ready(source, target, task):
-    """Typing in a required field: grey Run out until all three are filled."""
+    """Grey Run out until the required fields are filled."""
     return gr.update(interactive=required_filled(source, target, task))

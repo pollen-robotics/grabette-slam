@@ -115,16 +115,13 @@ def _render_content(st: dict, review_state) -> None:
     """Content gate: one card per ticked feature that some kept episodes lack.
     The user must choose, for each, between adding it (and leaving out those
     episodes) and not adding it; Continue stays disabled until every choice is
-    made. A feature no episode has can only be left out: it is shown as a
-    warning, and when that's all there is the button reads "Continue anyway"."""
+    made. A feature no episode has is only shown as a warning."""
     items, choices = st["items"], st.get("choices", {})
     forced = [it for it in items if it["forced"]]
     to_choose = len(items) - len(forced)
-    intro = ("For each feature, choose whether to add it — leaving out the episodes "
-             "without it — or not to add it, then **Continue**." if to_choose else
-             "They won't be in the dataset. Untick them and restart, or "
-             "**Continue anyway** without them.")
-    gr.Markdown("### ⚠️ Some episodes don't have the selected features\n" + intro)
+    intro = ("\nFor each feature, choose whether to add it — leaving out the episodes "
+             "without it — or not to add it, then **Continue**." if to_choose else "")
+    gr.Markdown("### ⚠️ Some episodes don't have the selected optional features" + intro)
     pending = 0
     with gr.Column(elem_id="review-cards"):
         for it in items:

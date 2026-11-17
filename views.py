@@ -99,10 +99,8 @@ def error_card(msg: str) -> str:
 
 def selection_card(source="", target="", task="", features=None) -> str:
     """Small read-only recap of the user's inputs, shown in place of the editable
-    fields while a run is in progress.
-
-    features: labels of the optional features ticked for this run (None = not
-    known, e.g. a push retry, and then left out of the card)."""
+    fields while a run is in progress. features=None (e.g. a push retry) omits
+    that row."""
     rows = []
     if source:
         rows.append(f"Source: <code>{html.escape(source)}</code>")
@@ -186,8 +184,7 @@ def success_summary(target_repo: str, n: int, link: str | None, mode: str) -> st
 
 
 def required_filled(source, target, task) -> bool:
-    """Source, target and task all filled (whitespace alone doesn't count, as the
-    run strips it): the condition for Run to be clickable."""
+    """Source, target and task all filled (whitespace doesn't count)."""
     return all((v or "").strip() for v in (source, target, task))
 
 
@@ -250,11 +247,9 @@ def inputs_view(state, *, source="", target="", task="", features=None):
     """Updates for [source, target, task, debug_sync, keep, selection_card].
 
     Once a run starts and until it's reset (state 'running' or 'finished') the
-    editable fields — the optional features and the debug toggle included: the
-    run has already read them, so changing them mid-run would do nothing — are
-    hidden and replaced by a small read-only recap card. Only the idle page (and
-    the recoverable preflight/target-exists states) shows the editable fields;
-    there the card is hidden."""
+    editable fields are hidden and replaced by a small read-only recap card. Only
+    the idle page (and the recoverable preflight/target-exists states) shows the
+    editable fields; there the card is hidden."""
     hide = state in ("running", "finished")
     fld = gr.update(visible=not hide)
     if hide:

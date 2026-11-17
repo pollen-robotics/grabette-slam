@@ -78,10 +78,7 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
     with gr.Row():
         # ---- Inputs (left) ----
         with gr.Column(scale=2, min_width=280):
-            # Signed out: only a big Sign-in button and a one-line why — the form
-            # is useless without an account (every Hub call runs as the user).
-            # Signing in/out reloads the page (HF OAuth redirect), and demo.load
-            # (signed_in_view) then shows the form and shrinks the button.
+            # Form shown only once signed in (see signed_in_view).
             login_btn = gr.LoginButton(size="lg", variant="primary")
             signin_hint = gr.Markdown(
                 "Sign in with your Hugging Face account to process a dataset.")
@@ -110,7 +107,7 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
                 # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
                 # Finished: only Reset. All visibility is driven by the generators.
                 with gr.Row():
-                    # Greyed until the required (*) fields are filled (see run_ready).
+                    # Greyed until the required fields are filled.
                     run_btn = gr.Button("▶  Run", variant="primary", scale=2,
                                         interactive=False)
                     pause_btn = gr.Button("⏸  Pause", variant="secondary",
@@ -174,8 +171,7 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
     demo.load(signed_in_view, inputs=None,
               outputs=[login_btn, signin_hint, signed_in_form])
     reset_btn.click(reset, inputs=[source, target, task], outputs=outputs)
-    # Required fields: Run follows them as they're edited. Only fires on the idle
-    # page — while running the fields are hidden, so they can't change.
+    # Run follows the required fields as they're edited.
     for _fld in (source, target, task):
         _fld.change(run_ready, inputs=[source, target, task], outputs=run_btn,
                     show_progress="hidden")

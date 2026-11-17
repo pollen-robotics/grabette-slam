@@ -80,8 +80,7 @@ def content_plan(arm_dirs, keep=None, unit="episode", declined=()):
     arm_dirs: every per-arm episode dir that is about to be built.
     keep: the user's choice (CONTENT_OPTIONS keys), None = no choice (see below).
     unit: what one arm dir is called in the summary ("episode" / "arm recording").
-    declined: keys the user ticked but left out at the content review (see
-        apply_content_decisions) — summarised as such, not as "unticked".
+    declined: keys ticked but left out at the content review.
 
     Returns (builder kwargs, summary lines). The kwargs are explicit True/False
     decisions, so the builder does exactly what the summary says:
@@ -170,10 +169,8 @@ def content_gaps(arm_dirs, keep):
 def apply_content_decisions(episodes, keep, gaps, decisions, log=print):
     """Apply the user's choice for each gap: "drop" removes the stream from keep,
     "exclude" removes the episodes without it. A stream no episode has can only be
-    dropped. In the fleet's role layout an excluded arm takes its whole recording
-    with it (the other arms couldn't be paired into a LeRobot episode anyway, and
-    this runs before SLAM, so they'd only be processed for nothing).
-    Returns (episodes, keep, declined) — declined: the keys removed from keep."""
+    dropped. In the role layout an excluded arm takes its whole recording with it.
+    Returns (episodes, keep, declined), declined being the keys removed from keep."""
     keep = list(keep)
     declined: list = []
     excluded: set = set()
@@ -621,12 +618,10 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
     keep: optional content to keep in the dataset (CONTENT_OPTIONS keys, see
         content_kwargs); None = no choice.
     content_review: optional callback(gaps) -> {key: "drop" | "exclude"}, called
-        right after the pre-SLAM review (stream presence only needs the raw
-        files) when ticked streams are missing from some or all of the kept
-        episodes (see content_gaps). For each, the user decides: drop the stream,
-        or exclude the episodes without it — before they cost a SLAM run. Later
-        drops can't reopen a gap: every remaining episode has each kept stream.
-        Without it, a ticked stream excludes those episodes at build time.
+        after the pre-SLAM review when ticked streams are missing from some or
+        all of the kept episodes (see content_gaps). For each, the user decides:
+        drop the stream, or exclude the episodes without it. Without it, a ticked
+        stream excludes those episodes at build time.
     """
     content_kwargs(keep)  # reject a bad option before the slow SLAM, not after
     # No global HF_TOKEN here: this function only builds locally and resolves the
@@ -652,8 +647,7 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
     if not episodes:
         raise RuntimeError("All episodes were dropped in the pre-SLAM review — nothing to process.")
 
-    # Content review: a ticked stream some (or all) kept episodes lack → the user
-    # picks, per stream, between not adding it and excluding those episodes.
+    # Content review, before SLAM: presence only needs the raw files.
     declined: list = []
     if content_review is not None:
         gaps = content_gaps(episodes, keep)
