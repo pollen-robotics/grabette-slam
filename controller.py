@@ -22,7 +22,7 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 
 import session
-from pipeline import build_lerobot, episode_label, push_lerobot
+from pipeline import CONTENT_OPTIONS, build_lerobot, episode_label, push_lerobot
 from views import (
     bar,
     btns,
@@ -203,8 +203,8 @@ def _reset_view(sess):
 
 
 def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch, sess):
-    """Streaming generator behind Run / Push-to-branch. Yields the 16-element
-    `outputs` tuple: bar, log, summary, retry_state, the 8 buttons, then the 4
+    """Streaming generator behind Run / Push-to-branch. Yields the 18-element
+    `outputs` tuple: bar, log, summary, retry_state, the 8 buttons, then the 6
     inputs-view fields. The episode-review panel is a separate reactive @gr.render
     block (review.build_panel), not part of this tuple.
 
@@ -234,6 +234,7 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
     scopes = frozenset((getattr(oauth_token, "scope", "") or "").split())
 
     sess.start_run()  # fresh run: clear this session's flags
+    features = [CONTENT_OPTIONS[k] for k in (keep or []) if k in CONTENT_OPTIONS]
 
     logs: list[str] = []
     start = time.time()
@@ -254,7 +255,7 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
                       branch=branch, retry=retry,
                       allow_pause=not in_review),
                 *inputs_view(state, source=source_repo, target=target_repo,
-                             task=task))
+                             task=task, features=features))
 
     # ---- Pre-flight (synchronous, fast) ---------------------------------
     logs.append("Checking repo access…")
@@ -529,7 +530,7 @@ def retry_push(retry_ctx, oauth_token: gr.OAuthToken | None = None,
         return "\n".join(logs)
 
     def view(summary="", *, state="running", retry=False, ctx=retry_ctx):
-        # 16-output shape, same as _run. A push can't be paused, so allow_pause
+        # 18-output shape, same as _run. A push can't be paused, so allow_pause
         # is False; Cancel still works (abandons the retry).
         return (*io(state, bar(frac, f"{label} · {int(time.time() - start)}s"), render()),
                 summary, ctx,

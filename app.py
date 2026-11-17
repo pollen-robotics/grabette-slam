@@ -91,12 +91,11 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
             # run asks before the build (content review): add it and leave those
             # episodes out, or don't add it.
             keep = gr.CheckboxGroup(
-                label="Dataset content", elem_id="content-keep",
+                label="Optional features to convert to LeRobot", elem_id="content-keep",
                 choices=[(label, key) for key, label in CONTENT_OPTIONS.items()],
                 value=list(CONTENT_OPTIONS),
                 info="If some episodes lack a ticked stream, you'll choose before the "
-                     "build: add it (leaving them out) or not. Right image and IMU "
-                     "exist on OAK-D episodes only.")
+                     "build: add it (leaving them out) or not.")
             # Read-only recap of the inputs, shown in their place while running.
             selection_card = gr.HTML(visible=False)
             # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
@@ -150,11 +149,11 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
     # Order MUST match the generators' yields (views.io → bar, log; then summary,
     # retry_state; then views.btns → branch, retry, run, pause, cancel,
     # confirm_cancel, keep, reset; then views.inputs_view → source, target, task,
-    # selection_card). The review panel is reactive, NOT in this list.
+    # debug_sync, keep, selection_card). The review panel is reactive, NOT in this list.
     outputs = [bar_out, log_out, summary_out, retry_state,
                confirm_branch_btn, retry_btn,
                run_btn, pause_btn, cancel_btn, confirm_cancel_btn, keep_btn, reset_btn,
-               source, target, task, selection_card]
+               source, target, task, debug_sync, keep, selection_card]
     run_event = run_btn.click(run_pipeline, inputs=[source, target, task, debug_sync, keep],
                               outputs=outputs)
     branch_event = confirm_branch_btn.click(run_pipeline_branch,

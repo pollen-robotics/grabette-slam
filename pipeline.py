@@ -32,7 +32,7 @@ _PUSH_LOCK = threading.Lock()
 # is always written. key -> UI label.
 CONTENT_OPTIONS = {
     "depth": "Depth map (dcam_depth)",
-    "right": "Right image (dcam_r, OAK-D only)",
+    "right": "Right image (dcam_r)",
     "imu": "IMU",
 }
 
@@ -68,7 +68,7 @@ CONTENT_LOG_PREFIX = "[content]"
 # Feature name and why a stream may be missing, per optional stream.
 _CONTENT_STREAMS = {
     "depth": ("dcam_depth", "depth map"),
-    "right": ("dcam_r", "right image: OAK-D only"),
+    "right": ("dcam_r", "right image"),
     "imu": ("imu", "IMU"),
 }
 

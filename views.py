@@ -97,9 +97,12 @@ def error_card(msg: str) -> str:
     )
 
 
-def selection_card(source="", target="", task="") -> str:
+def selection_card(source="", target="", task="", features=None) -> str:
     """Small read-only recap of the user's inputs, shown in place of the editable
-    fields while a run is in progress."""
+    fields while a run is in progress.
+
+    features: labels of the optional features ticked for this run (None = not
+    known, e.g. a push retry, and then left out of the card)."""
     rows = []
     if source:
         rows.append(f"Source: <code>{html.escape(source)}</code>")
@@ -107,6 +110,9 @@ def selection_card(source="", target="", task="") -> str:
         rows.append(f"Target: <code>{html.escape(target)}</code>")
     if task:
         rows.append(f"Task: {html.escape(task)}")
+    if features is not None:
+        rows.append("Optional features: " + (", ".join(html.escape(f) for f in features)
+                                             or "none"))
     return (
         '<div style="font-size:12px;color:var(--body-text-color-subdued);'
         'border:1px solid var(--border-color-primary,#e5e7eb);border-radius:8px;'
@@ -233,21 +239,23 @@ def io(state, bar_html, log_text):
             gr.update(value=log_text, visible=show))
 
 
-def inputs_view(state, *, source="", target="", task=""):
-    """Updates for [source, target, task, selection_card].
+def inputs_view(state, *, source="", target="", task="", features=None):
+    """Updates for [source, target, task, debug_sync, keep, selection_card].
 
     Once a run starts and until it's reset (state 'running' or 'finished') the
-    editable fields are hidden and replaced by a small read-only recap card. Only
-    the idle page (and the recoverable preflight/target-exists states) shows the
-    editable fields; there the card is hidden."""
+    editable fields — the optional features and the debug toggle included: the
+    run has already read them, so changing them mid-run would do nothing — are
+    hidden and replaced by a small read-only recap card. Only the idle page (and
+    the recoverable preflight/target-exists states) shows the editable fields;
+    there the card is hidden."""
     hide = state in ("running", "finished")
     fld = gr.update(visible=not hide)
     if hide:
         card = gr.update(visible=True,
-                         value=selection_card(source, target, task))
+                         value=selection_card(source, target, task, features))
     else:
         card = gr.update(visible=False)
-    return (fld, fld, fld, card)
+    return (fld, fld, fld, fld, fld, card)
 
 
 # ---- Episode-review cards -------------------------------------------------
