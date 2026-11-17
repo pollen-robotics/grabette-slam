@@ -41,6 +41,7 @@ from controller import (
     request_cancel,
     reset,
     run_ready,
+    signed_in_view,
     retry_push,
     run_pipeline,
     run_pipeline_branch,
@@ -77,55 +78,62 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
     with gr.Row():
         # ---- Inputs (left) ----
         with gr.Column(scale=2, min_width=280):
-            gr.LoginButton(size="sm")
-            source = gr.Textbox(label="Source dataset *", info="raw Grabette repo on the Hub",
-                                placeholder="pollen-robotics/grabette-raw")
-            target = gr.Textbox(label="Target dataset *", info="repo to create or contribute to",
-                                placeholder="your-account/grabette-dataset")
-            task = gr.Textbox(label="Task description *", placeholder="cup grasping")
-            # Sync checks (depth-cam↔gyro pre-SLAM, image↔trajectory post-SLAM) are a
-            # debug-only diagnostic — off by default so a normal run skips them.
-            debug_sync = gr.Checkbox(
-                label="Run sync checks (debug)", value=False,
-                info="Extra camera↔IMU / image↔trajectory timing diagnostics")
-            # Optional dataset content. If some episodes lack a ticked stream, the
-            # run asks before the build (content review): add it and leave those
-            # episodes out, or don't add it.
-            keep = gr.CheckboxGroup(
-                label="Optional features to convert to LeRobot", elem_id="content-keep",
-                choices=[(label, key) for key, label in CONTENT_OPTIONS.items()],
-                value=list(CONTENT_OPTIONS),
-                info="If some episodes lack a ticked stream, you'll choose before the "
-                     "build: add it (leaving them out) or not.")
-            # Read-only recap of the inputs, shown in their place while running.
-            selection_card = gr.HTML(visible=False)
-            # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
-            # Finished: only Reset. All visibility is driven by the generators.
-            with gr.Row():
-                # Greyed until the required (*) fields are filled (see run_ready).
-                run_btn = gr.Button("▶  Run", variant="primary", scale=2,
-                                    interactive=False)
-                pause_btn = gr.Button("⏸  Pause", variant="secondary",
-                                      scale=1, visible=False)
-                cancel_btn = gr.Button("✕  Cancel", variant="stop",
-                                       scale=1, visible=False)
-            # Cancel confirmation (revealed by Cancel; replaces Pause/Cancel).
-            with gr.Row():
-                confirm_cancel_btn = gr.Button("✓  Confirm cancel", variant="stop",
-                                               size="sm", visible=False)
-                keep_btn = gr.Button("Keep running", variant="secondary",
-                                     size="sm", visible=False)
-            # Revealed (as the primary action, replacing Run) only when the target
-            # dataset already exists (see the controller).
-            confirm_branch_btn = gr.Button("⎇  Push to a new branch",
-                                           variant="primary", visible=False)
-            # Revealed only when a build succeeded but the push failed.
-            retry_btn = gr.Button("⟳  Retry push", variant="secondary",
-                                  size="sm", visible=False)
-            # Shown once a run reaches a terminal state.
-            reset_btn = gr.Button("↺  Reset", variant="secondary", visible=False)
-            # Holds the built-but-unpushed dataset context for retry_push.
-            retry_state = gr.State(None)
+            # Signed out: only a big Sign-in button and a one-line why — the form
+            # is useless without an account (every Hub call runs as the user).
+            # Signing in/out reloads the page (HF OAuth redirect), and demo.load
+            # (signed_in_view) then shows the form and shrinks the button.
+            login_btn = gr.LoginButton(size="lg", variant="primary")
+            signin_hint = gr.Markdown(
+                "Sign in with your Hugging Face account to process a dataset.")
+            with gr.Column(visible=False, elem_id="signed-in-form") as signed_in_form:
+                source = gr.Textbox(label="Source dataset *", info="raw Grabette repo on the Hub",
+                                    placeholder="pollen-robotics/grabette-raw")
+                target = gr.Textbox(label="Target dataset *", info="repo to create or contribute to",
+                                    placeholder="your-account/grabette-dataset")
+                task = gr.Textbox(label="Task description *", placeholder="cup grasping")
+                # Sync checks (depth-cam↔gyro pre-SLAM, image↔trajectory post-SLAM) are a
+                # debug-only diagnostic — off by default so a normal run skips them.
+                debug_sync = gr.Checkbox(
+                    label="Run sync checks (debug)", value=False,
+                    info="Extra camera↔IMU / image↔trajectory timing diagnostics")
+                # Optional dataset content. If some episodes lack a ticked stream, the
+                # run asks before the build (content review): add it and leave those
+                # episodes out, or don't add it.
+                keep = gr.CheckboxGroup(
+                    label="Optional features to convert to LeRobot", elem_id="content-keep",
+                    choices=[(label, key) for key, label in CONTENT_OPTIONS.items()],
+                    value=list(CONTENT_OPTIONS),
+                    info="If some episodes lack a ticked stream, you'll choose before the "
+                         "build: add it (leaving them out) or not.")
+                # Read-only recap of the inputs, shown in their place while running.
+                selection_card = gr.HTML(visible=False)
+                # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
+                # Finished: only Reset. All visibility is driven by the generators.
+                with gr.Row():
+                    # Greyed until the required (*) fields are filled (see run_ready).
+                    run_btn = gr.Button("▶  Run", variant="primary", scale=2,
+                                        interactive=False)
+                    pause_btn = gr.Button("⏸  Pause", variant="secondary",
+                                          scale=1, visible=False)
+                    cancel_btn = gr.Button("✕  Cancel", variant="stop",
+                                           scale=1, visible=False)
+                # Cancel confirmation (revealed by Cancel; replaces Pause/Cancel).
+                with gr.Row():
+                    confirm_cancel_btn = gr.Button("✓  Confirm cancel", variant="stop",
+                                                   size="sm", visible=False)
+                    keep_btn = gr.Button("Keep running", variant="secondary",
+                                         size="sm", visible=False)
+                # Revealed (as the primary action, replacing Run) only when the target
+                # dataset already exists (see the controller).
+                confirm_branch_btn = gr.Button("⎇  Push to a new branch",
+                                               variant="primary", visible=False)
+                # Revealed only when a build succeeded but the push failed.
+                retry_btn = gr.Button("⟳  Retry push", variant="secondary",
+                                      size="sm", visible=False)
+                # Shown once a run reaches a terminal state.
+                reset_btn = gr.Button("↺  Reset", variant="secondary", visible=False)
+                # Holds the built-but-unpushed dataset context for retry_push.
+                retry_state = gr.State(None)
         # ---- Outputs (right) ----
         with gr.Column(scale=3, min_width=280):
             # Bar + log are revealed only while a run is in progress (running /
@@ -163,6 +171,8 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
                                             inputs=[source, target, task, debug_sync, keep],
                                             outputs=outputs)
     retry_event = retry_btn.click(retry_push, inputs=[retry_state], outputs=outputs)
+    demo.load(signed_in_view, inputs=None,
+              outputs=[login_btn, signin_hint, signed_in_form])
     reset_btn.click(reset, inputs=[source, target, task], outputs=outputs)
     # Required fields: Run follows them as they're edited. Only fires on the idle
     # page — while running the fields are hidden, so they can't change.

@@ -622,6 +622,16 @@ def reset(source="", target="", task="", request: gr.Request = None):
                        ready=required_filled(source, target, task))
 
 
+def signed_in_view(profile: gr.OAuthProfile | None = None):
+    """Page load: signed out → only the big Sign-in button (+ hint); signed in →
+    the form, with the button back to a small secondary Logout."""
+    on = profile is not None
+    return (gr.update(size="sm" if on else "lg",
+                      variant="secondary" if on else "primary"),
+            gr.update(visible=not on),
+            gr.update(visible=on))
+
+
 def run_ready(source, target, task):
     """Typing in a required field: grey Run out until all three are filled."""
     return gr.update(interactive=required_filled(source, target, task))
