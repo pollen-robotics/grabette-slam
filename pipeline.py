@@ -33,7 +33,7 @@ _PUSH_LOCK = threading.Lock()
 CONTENT_OPTIONS = {
     "depth": "Depth map (dcam_depth)",
     "right": "Right image (dcam_r, OAK-D only)",
-    "imu": "IMU (OAK-D only)",
+    "imu": "IMU",
 }
 
 
@@ -69,7 +69,7 @@ CONTENT_LOG_PREFIX = "[content]"
 _CONTENT_STREAMS = {
     "depth": ("dcam_depth", "depth map"),
     "right": ("dcam_r", "right image: OAK-D only"),
-    "imu": ("imu", "IMU: OAK-D only"),
+    "imu": ("imu", "IMU"),
 }
 
 

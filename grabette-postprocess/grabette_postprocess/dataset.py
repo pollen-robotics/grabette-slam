@@ -9,7 +9,7 @@ Camera observations, all selected nearest-by-timestamp against the trajectory:
   - dcam_depth (unless disabled): the depth map (dcam_depth.mkv, uint16 mm),
     pixel-registered to dcam's sensor, stored as a LeRobot depth stream
     (see DEPTH_QUANTIZATION).
-Plus `imu` (accel, gyro, fused rotation; OAK-D only) resampled onto the frames,
+Plus `imu` (accel, gyro, fused rotation; when recorded) resampled onto the frames,
 and a per-episode `depth_camera` model column in the episodes metadata.
 
 A LeRobot schema is the same for every episode, so dcam_r / imu are added
@@ -192,7 +192,7 @@ def _has_right(episode_dir: Path) -> bool:
 
 
 def _has_imu(episode_dir: Path) -> bool:
-    """dcam_imu.json with at least one sample (OAK-D recordings)."""
+    """dcam_imu.json with at least one sample (e.g. OAK-D recordings)."""
     return _load_imu(episode_dir) is not None
 
 
