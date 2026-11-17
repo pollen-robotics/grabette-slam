@@ -391,20 +391,19 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
                             [(episode_label(ep), ep) for ep, _ in results])
 
     def content_review_cb(gaps):
-        """Called by build_lerobot before the build when ticked features are missing
-        from some kept episodes (pipeline.content_gaps). Publishes one item per
-        feature on THIS session's panel (kind "content") and blocks until the user
-        has chosen, for each, "exclude" (keep it, leave out those episodes) or "drop"
-        (don't add it). Returns {key: choice}. A feature no episode has can only be
-        dropped: when that's all there is, nothing to ask — the run goes on."""
+        """Called by build_lerobot right after the pre-SLAM review when ticked
+        features are missing from some or all kept episodes (pipeline.content_gaps).
+        Publishes one item per feature on THIS session's panel (kind "content") and
+        blocks until the user has chosen, for each, "exclude" (keep it, leave out
+        those episodes) or "drop" (don't add it). Returns {key: choice}. A feature
+        no episode has can only be dropped, but it is still shown — the user
+        continues knowing it won't be in the dataset."""
         items = [{"key": g["key"], "label": g["label"], "total": g["total"],
                   "missing": [name for name, _ in g["missing"]],
                   "forced": len(g["missing"]) == g["total"]}
                  for g in gaps]
-        if all(it["forced"] for it in items):
-            return {}
         print(f"⏸ Content review: {len(items)} selected feature(s) missing from some "
-              f"episodes — choose, for each, then click Continue.")
+              f"or all episodes — review them, then click Continue.")
         sess.review_kind = "content"
         sess.review_items[:] = items
         sess.review_choices.clear()

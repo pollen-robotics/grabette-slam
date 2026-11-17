@@ -11,6 +11,8 @@ so a flagged episode is only ever shown to the user whose run produced it — no
 here is module-global, precisely so nothing leaks between concurrent users.
 """
 
+import html
+
 import gradio as gr
 
 import session
@@ -113,19 +115,26 @@ def _render_content(st: dict, review_state) -> None:
     """Content gate: one card per ticked feature that some kept episodes lack.
     The user must choose, for each, between adding it (and leaving out those
     episodes) and not adding it; Continue stays disabled until every choice is
-    made. A feature no episode has can only be left out, so it is just stated."""
+    made. A feature no episode has can only be left out: it is shown as a
+    warning, and when that's all there is the button reads "Continue anyway"."""
     items, choices = st["items"], st.get("choices", {})
-    gr.Markdown(
-        "### ⚠️ Some episodes don't have the selected features\n"
-        "For each feature, choose whether to add it — leaving out the episodes "
-        "without it — or not to add it, then **Continue**."
-    )
+    forced = [it for it in items if it["forced"]]
+    to_choose = len(items) - len(forced)
+    intro = ("For each feature, choose whether to add it — leaving out the episodes "
+             "without it — or not to add it, then **Continue**." if to_choose else
+             "They won't be in the dataset. Untick them and restart, or "
+             "**Continue anyway** without them.")
+    gr.Markdown("### ⚠️ Some episodes don't have the selected features\n" + intro)
     pending = 0
     with gr.Column(elem_id="review-cards"):
         for it in items:
             names, total = it["missing"], it["total"]
             if it["forced"]:
-                gr.Markdown(f"**{it['label']}** — no episode has it: it won't be added.")
+                gr.HTML(
+                    '<div style="border-left:4px solid #f97316;border-radius:8px;'
+                    'padding:9px 12px;background:rgba(249,115,22,.08)">'
+                    f'<b>{html.escape(it["label"])}</b> — none of the {total} episode(s) '
+                    'has it, so it won\'t be included in the dataset.</div>')
                 continue
             shown = ", ".join(names[:8]) + (f" … (+{len(names) - 8})" if len(names) > 8 else "")
             arm = (" In a multi-arm recording, the whole recording is left out."
@@ -140,7 +149,9 @@ def _render_content(st: dict, review_state) -> None:
                          outputs=review_state)
             pending += it["key"] not in choices
     with gr.Row(elem_id="review-actions"):
-        gr.Button("▶  Continue (build the dataset)" if not pending
-                  else f"Choose for {pending} feature(s) to continue",
+        label = (f"Choose for {pending} feature(s) to continue" if pending
+                 else "▶  Continue (run SLAM)" if to_choose
+                 else "▶  Continue anyway")
+        gr.Button(label,
                   size="sm", elem_classes=["btn-orange"],
                   interactive=not pending).click(submit_review, inputs=None, outputs=None)

@@ -143,7 +143,7 @@ def run_recap(logs: list[str]) -> str:
 
 
 def content_recap(logs: list[str]) -> str:
-    """The "Dataset content" section of the final card: what was kept or left out
+    """The "Features converted to LeRobot" section of the final card: what was kept or left out
     of the dataset and why, lifted from the `[content]` lines that
     pipeline.build_recordings logs before the build. "" when there are none
     (e.g. a push-only retry)."""
@@ -151,7 +151,7 @@ def content_recap(logs: list[str]) -> str:
     items = [ln.strip()[len(marker):] for ln in logs if ln.strip().startswith(marker)]
     if not items:
         return ""
-    return "\n\n**Dataset content**\n" + "\n".join(f"- {i}" for i in items)
+    return "\n\n**Features converted to LeRobot**\n" + "\n".join(f"- {i}" for i in items)
 
 
 def success_summary(target_repo: str, n: int, link: str | None, mode: str) -> str:
@@ -369,7 +369,7 @@ CSS = """
 footer {display: none !important;}
 /* The page is as wide as its widest content, and the input/output columns only
    sit side by side once that is wide enough — otherwise they stack and the form
-   is centred. The "Dataset content" chips + info line are wide enough on one line
+   is centred. The optional-features chips + info line are wide enough on one line
    to flip that, pushing the form to the left of an empty output column. Taking
    the group out of the intrinsic-width computation keeps the original layout:
    it now wraps to the column's width instead of setting it. */

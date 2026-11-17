@@ -73,13 +73,15 @@ _CONTENT_STREAMS = {
 }
 
 
-def content_plan(arm_dirs, keep=None, unit="episode"):
+def content_plan(arm_dirs, keep=None, unit="episode", declined=()):
     """Decide the optional dataset content from what the episodes actually have,
     and explain it.
 
     arm_dirs: every per-arm episode dir that is about to be built.
     keep: the user's choice (CONTENT_OPTIONS keys), None = no choice (see below).
     unit: what one arm dir is called in the summary ("episode" / "arm recording").
+    declined: keys the user ticked but left out at the content review (see
+        apply_content_decisions) — summarised as such, not as "unticked".
 
     Returns (builder kwargs, summary lines). The kwargs are explicit True/False
     decisions, so the builder does exactly what the summary says:
@@ -105,7 +107,12 @@ def content_plan(arm_dirs, keep=None, unit="episode"):
     for key, (feature, why) in _CONTENT_STREAMS.items():
         choice = wanted[f"with_{key}"]  # True = ticked, False = unticked, None = auto
         n = count[key]
-        if choice is False:
+        if choice is False and key in declined:
+            decided[key] = False
+            lines.append(f"{feature}: not kept — no {unit} has it ({why})" if n == 0 else
+                         f"{feature}: not kept — left out at review "
+                         f"(only on {n}/{total} {units})")
+        elif choice is False:
             decided[key] = False
             lines.append(f"{feature}: not kept — unticked (available on {n}/{total} {units})")
         elif choice is True:
@@ -163,8 +170,12 @@ def content_gaps(arm_dirs, keep):
 def apply_content_decisions(episodes, keep, gaps, decisions, log=print):
     """Apply the user's choice for each gap: "drop" removes the stream from keep,
     "exclude" removes the episodes without it. A stream no episode has can only be
-    dropped. Returns (episodes, keep)."""
+    dropped. In the fleet's role layout an excluded arm takes its whole recording
+    with it (the other arms couldn't be paired into a LeRobot episode anyway, and
+    this runs before SLAM, so they'd only be processed for nothing).
+    Returns (episodes, keep, declined) — declined: the keys removed from keep."""
     keep = list(keep)
+    declined: list = []
     excluded: set = set()
     for g in gaps:
         choice = "drop" if len(g["missing"]) == g["total"] else decisions.get(g["key"], "drop")
@@ -175,13 +186,18 @@ def apply_content_decisions(episodes, keep, gaps, decisions, log=print):
                 f"{', '.join(names)}")
         else:
             keep.remove(g["key"])
+            declined.append(g["key"])
             log(f"  • {g['label']}: not added ({len(g['missing'])}/{g['total']} "
                 f"episode(s) don't have it)")
-    return [ep for ep in episodes if Path(ep) not in excluded], keep
+    if excluded and detect_roles(episodes):
+        recordings = {Path(d).parent.name for d in excluded}
+        log(f"  • leaving out the whole recording(s): {', '.join(sorted(recordings))}")
+        excluded = {Path(ep) for ep in episodes if Path(ep).parent.name in recordings}
+    return [ep for ep in episodes if Path(ep) not in excluded], keep, declined
 
 
 def _log_content(lines, log) -> None:
-    log("Dataset content:")
+    log("Features converted to LeRobot:")
     for ln in lines:
         log(f"  {CONTENT_LOG_PREFIX} {ln}")
 
@@ -257,7 +273,8 @@ def episode_label(ep: Path) -> str:
 
 
 def build_recordings(target_repo, task, root, episodes, report_by_ep,
-                     roles=None, source_user=None, log=print, keep=None) -> list:
+                     roles=None, source_user=None, log=print, keep=None,
+                     declined=()) -> list:
     """Build the LeRobot dataset on disk from the kept episode dirs, picking the
     schema from the raw layout. Shared by the UI run (build_lerobot) and the
     headless REST run so both produce the SAME dataset for the same raw input.
@@ -285,7 +302,8 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
     if not roles:
         tags_by_recording = {ep.name: episode_tags(ep, report_by_ep.get(ep))
                              for ep in episodes}
-        content, lines = content_plan(episodes, keep, unit="episode")
+        content, lines = content_plan(episodes, keep, unit="episode",
+                                      declined=declined)
         _log_content(lines, log)
         log(f"Building LeRobot dataset from {len(episodes)} episode(s)…")
         build_dataset(repo_id=target_repo, episode_dirs=episodes, task=task,
@@ -315,7 +333,7 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
     }
     content, lines = content_plan(
         [group[r] for group in groups.values() for r in roles], keep,
-        unit="arm recording")
+        unit="arm recording", declined=declined)
     _log_content(lines, log)
     log(f"Building LeRobot dataset ({'+'.join(roles)}) from "
         f"{len(groups)} recording(s)…")
@@ -575,8 +593,8 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
                   run_sync=False, keep=None, content_review=None) -> list:
     """Check + SLAM + build the LeRobot dataset on disk under `root`.
 
-    Pipeline: completeness/sync prechecks → (pre_review drop) → convert+SLAM →
-    (trajectory review drop) → build. Returns the list of built recordings — one
+    Pipeline: completeness/sync prechecks → (pre_review drop) → (content review)
+    → convert+SLAM → (trajectory review drop) → build. Returns the list of built recordings — one
     entry per LeRobot episode written, so len() is the episode count to push (see
     build_recordings: recording ids in the fleet's role layout, episode dirs in
     the flat one). Does NOT push — call push_lerobot() afterwards. Splitting build from push lets
@@ -603,10 +621,12 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
     keep: optional content to keep in the dataset (CONTENT_OPTIONS keys, see
         content_kwargs); None = no choice.
     content_review: optional callback(gaps) -> {key: "drop" | "exclude"}, called
-        after the trajectory review when ticked streams are missing from some of
-        the kept episodes (see content_gaps). For each, the user decides: drop
-        the stream, or exclude the episodes without it. Without it, a ticked
-        stream excludes those episodes.
+        right after the pre-SLAM review (stream presence only needs the raw
+        files) when ticked streams are missing from some or all of the kept
+        episodes (see content_gaps). For each, the user decides: drop the stream,
+        or exclude the episodes without it — before they cost a SLAM run. Later
+        drops can't reopen a gap: every remaining episode has each kept stream.
+        Without it, a ticked stream excludes those episodes at build time.
     """
     content_kwargs(keep)  # reject a bad option before the slow SLAM, not after
     # No global HF_TOKEN here: this function only builds locally and resolves the
@@ -631,6 +651,21 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
         raise RuntimeError("Stopped by user — nothing pushed.")
     if not episodes:
         raise RuntimeError("All episodes were dropped in the pre-SLAM review — nothing to process.")
+
+    # Content review: a ticked stream some (or all) kept episodes lack → the user
+    # picks, per stream, between not adding it and excluding those episodes.
+    declined: list = []
+    if content_review is not None:
+        gaps = content_gaps(episodes, keep)
+        if gaps:
+            decisions = content_review(gaps)
+            if should_stop and should_stop():
+                raise RuntimeError("Stopped by user — nothing pushed.")
+            episodes, keep, declined = apply_content_decisions(
+                episodes, keep, gaps, decisions or {}, log=log)
+            if not episodes:
+                raise RuntimeError("Every episode was excluded for a missing "
+                                   "feature — nothing to process.")
     if gate:
         gate()  # pause checkpoint before the (slow) SLAM phase
 
@@ -654,19 +689,6 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
     if not processed:
         raise RuntimeError("All episodes were dropped in review — nothing to push.")
 
-    # Content review: a ticked stream some kept episodes lack → the user picks,
-    # per stream, between not adding it and excluding those episodes.
-    if content_review is not None:
-        gaps = content_gaps(processed, keep)
-        if gaps:
-            decisions = content_review(gaps)
-            if should_stop and should_stop():
-                raise RuntimeError("Stopped by user — nothing pushed.")
-            processed, keep = apply_content_decisions(processed, keep, gaps,
-                                                      decisions or {}, log=log)
-            if not processed:
-                raise RuntimeError("Every episode was excluded for a missing "
-                                   "feature — nothing to push.")
     if gate:
         gate()  # pause checkpoint before the (CPU-heavy) build
 
@@ -693,7 +715,8 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
     # kept-but-flagged episodes stay filterable downstream.
     report_by_ep = {ep: report for ep, report in results}
     return build_recordings(target_repo, task, root, processed, report_by_ep,
-                            source_user=source_user, log=log, keep=keep)
+                            source_user=source_user, log=log, keep=keep,
+                            declined=declined)
 
 
 def push_lerobot(target_repo, task, root, n_episodes, to_branch=False,
