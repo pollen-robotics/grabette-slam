@@ -6,7 +6,7 @@ ambiguity-combo candidates of m's 4 corners expressed in the ref frame, pool ove
 whole clip, keep the densest cluster, median it -> m's true corners in the ref frame.
 
 Collision guard: the ChArUco board shares DICT_4X4_50 and overlaps ids 5-9, but its
-markers are physically smaller (18.75 mm vs 45 mm). We keep only ids in CUBE_IDS whose
+markers are physically smaller (18.75 mm vs 45 mm). We keep only this cube's ids whose
 detected side-length >= min_side_px, and if an id still duplicates in a frame, keep the
 largest instance. This rejects the static-board collisions.
 
@@ -62,12 +62,16 @@ def _to_ref(R_ref, t_ref, R_m, t_m):
     return (CANON @ rel_R.T) + rel_t     # (4,3)
 
 
-def calibrate_board(video: str, intrinsics: str, min_side_px: float = 25.0,
-                    cluster_m: float = 0.006, verbose: bool = True) -> dict:
+def calibrate_board(video: str, intrinsics: str, block: int = cb.BLOCK_R,
+                    min_side_px: float = 25.0, cluster_m: float = 0.006,
+                    verbose: bool = True) -> dict:
     """Learn per-marker 3D corners (vs the reference face) from a casquette clip.
 
-    Returns {"ref": id, "markers": {id: 4x3 corners}, "inliers": {id: n}}.
+    `block` selects which cube to calibrate (cb.BLOCK_L / cb.BLOCK_R); only that
+    cube's ids are used, so a clip showing both cubes still calibrates one.
+    Returns {"block", "ref", "markers": {id: 4x3 corners}, "inliers": {id: n}}.
     """
+    ids = cb.cube_ids(block)
     K, D = load_fisheye_intrinsics(intrinsics)
     adict = cv2.aruco.getPredefinedDictionary(cb.DICT)
     params = cv2.aruco.DetectorParameters()
@@ -77,17 +81,17 @@ def calibrate_board(video: str, intrinsics: str, min_side_px: float = 25.0,
     # ---- pass 1: per-frame cube-marker poses (ambiguity solutions kept) ----
     cap = cv2.VideoCapture(video)
     frames = []            # list of {id: [(R,t),...]} for cube markers passing the filter
-    seen = {m: 0 for m in cb.CUBE_IDS}
+    seen = {m: 0 for m in ids}
     while True:
         ok, fr = cap.read()
         if not ok:
             break
-        corners, ids, _ = det.detectMarkers(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
+        corners, ids_det, _ = det.detectMarkers(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
         best = {}            # id -> (side_px, img4) keep largest instance per id
-        if ids is not None:
-            for j, mid in enumerate(ids.flatten()):
+        if ids_det is not None:
+            for j, mid in enumerate(ids_det.flatten()):
                 m = int(mid)
-                if m not in cb.CUBE_IDS:
+                if m not in ids:
                     continue
                 c = corners[j].reshape(4, 2)
                 sp = _side_px(c)
@@ -112,7 +116,7 @@ def calibrate_board(video: str, intrinsics: str, min_side_px: float = 25.0,
     # ---- pass 2: pool ref<-m corner candidates, densest cluster, median ----
     OBJ = {int(ref): CANON.tolist()}
     inliers = {}
-    for m in sorted(cb.CUBE_IDS - {ref}):
+    for m in sorted(ids - {ref}):
         cand = []
         for poses in frames:
             if ref in poses and m in poses:
@@ -136,18 +140,20 @@ def calibrate_board(video: str, intrinsics: str, min_side_px: float = 25.0,
             print(f"  marker {m}: {len(cand)} candidates, densest cluster inliers={best_n}"
                   + ("" if best_n >= 3 else "  (too few -> dropped)"))
 
-    return {"ref": int(ref), "markers": OBJ, "inliers": inliers}
+    return {"block": int(block), "ref": int(ref), "markers": OBJ, "inliers": inliers}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("video")
     ap.add_argument("intr")
+    ap.add_argument("--block", type=int, default=cb.BLOCK_R,
+                    help="which cube: 0=left (ids 0-4), 1=right (ids 5-9)")
     ap.add_argument("--out", default="board_calib.json")
     ap.add_argument("--min-side-px", type=float, default=25.0, help="reject board-sized collisions")
     ap.add_argument("--cluster-m", type=float, default=0.006, help="corner-set cluster radius (m)")
     a = ap.parse_args()
-    result = calibrate_board(a.video, a.intr, a.min_side_px, a.cluster_m)
+    result = calibrate_board(a.video, a.intr, a.block, a.min_side_px, a.cluster_m)
     json.dump(result, open(a.out, "w"), indent=1)
     print(f"calibrated markers: {sorted(int(k) for k in result['markers'])} -> {a.out}")
 

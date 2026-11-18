@@ -24,6 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ._intrinsics import load_fisheye_intrinsics
+from .bimanual import to_grip_relative, track_bimanual
 from .board_calibrate import calibrate_board
 from .charuco_pose import charuco_pose
 from .cube_track_offline import track_cube
@@ -31,6 +32,8 @@ from .cube_track_offline import track_cube
 __all__ = [
     "calibrate_board",
     "track_cube",
+    "track_bimanual",
+    "to_grip_relative",
     "charuco_pose",
     "load_fisheye_intrinsics",
     "default_intrinsics_path",
