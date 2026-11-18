@@ -37,9 +37,23 @@ __all__ = [
     "charuco_pose",
     "load_fisheye_intrinsics",
     "default_intrinsics_path",
+    "default_calib_path",
 ]
 
 
 def default_intrinsics_path() -> Path:
     """Path to the packaged casquette fisheye intrinsics JSON."""
     return Path(__file__).parent / "data" / "casquette_camera_intrinsics.json"
+
+
+def default_calib_path(block: int) -> Path:
+    """Path to a packaged default cube calibration (block 0 = L, 1 = R).
+
+    These ship as sensible defaults; ideally each device's cube is recalibrated
+    with `calibrate_board` (hand-gluing differs per cube). Only blocks 0/1 have a
+    default calib.
+    """
+    tag = {0: "L", 1: "R"}.get(block)
+    if tag is None:
+        raise ValueError(f"no default calib for block {block} (only 0=L, 1=R ship)")
+    return Path(__file__).parent / "data" / f"board_calib_{tag}.json"

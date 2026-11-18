@@ -11,8 +11,11 @@ import pytest
 cv2 = pytest.importorskip("cv2")
 pytest.importorskip("cv2.aruco", reason="needs opencv-contrib-python")
 
+import json
+
 from grabette_postprocess.aruco_cube import (
     cube_board as cb,
+    default_calib_path,
     default_intrinsics_path,
     load_fisheye_intrinsics,
 )
@@ -40,6 +43,18 @@ def test_cube_board_blocks():
     # the OUT/reference face (role 0) of either cube sits at its own origin
     assert cb.nominal_center(0) == (0.0, 0.0, 0.0)
     assert cb.nominal_center(5) == (0.0, 0.0, 0.0)
+
+
+def test_default_calibs_ship_and_match_block():
+    """Packaged default calibs load and cover each cube's expected ids."""
+    for block, ref, ids in [(cb.BLOCK_L, 0, {0, 1, 2, 3, 4}),
+                            (cb.BLOCK_R, 5, {5, 6, 7, 8, 9})]:
+        j = json.load(open(default_calib_path(block)))
+        assert j["block"] == block
+        assert j["ref"] == ref
+        assert {int(k) for k in j["markers"]} == ids
+    with pytest.raises(ValueError):
+        default_calib_path(2)
 
 
 def test_to_ref_same_pose_is_canon():
