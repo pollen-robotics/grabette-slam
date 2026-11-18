@@ -6,7 +6,12 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "scipy",
-    "opencv-python",
+    # contrib (not plain opencv-python): aruco_cube needs cv2.aruco, contrib-only.
+    # It is a strict superset of opencv-python, so convert.py / oak_slam.py are
+    # unaffected. NOTE: lerobot pulls opencv-python transitively; the two share the
+    # cv2/ install dir and can clobber — if cv2.aruco goes missing in a built env,
+    # add a uv override pinning both names to the contrib build.
+    "opencv-contrib-python",
     "av",
     "click",
     "pandas",
@@ -17,6 +22,9 @@ dependencies = [
     # broke the pipeline. Bump deliberately after checking dataset.py against the API.
     "lerobot==0.5.1 ; python_version >= '3.12'",
 ]
+
+[project.optional-dependencies]
+test = ["pytest"]
 
 [build-system]
 requires = ["hatchling"]
