@@ -34,7 +34,7 @@ Episode directory (from Grabette)
 LeRobot v3 dataset/
 ├── meta/info.json, stats.json, tasks.parquet, episodes/
 ├── data/chunk-NNN/file-NNN.parquet
-└── videos/observation.images.cam0/chunk-NNN/file-NNN.mp4
+└── videos/observation.images.{cam0,dcam,dcam_r,dcam_depth}/chunk-NNN/file-NNN.mp4
 ```
 
 ## Setup
@@ -154,17 +154,94 @@ uv run python scripts/pipeline/generate_dataset.py \
   --repo_id myuser/grabette-demo \
   --task "cup manipulation" \
   --root ~/lerobot_datasets
+  # add --no-depth to leave the depth map out
 ```
 
 #### Dataset features
 
 | Feature | dtype | shape | Source |
 |---------|-------|-------|--------|
-| `observation.images.cam0` | video | (3, 720, 960) | episode video (resized) |
+| `observation.images.cam0` | video | (3, 720, 960) | RPi fisheye, `raw_video.mp4` (resized) |
+| `observation.images.dcam` | video | (3, 720, 960) | depth camera left image, `dcam_left.mp4` (resized) |
+| `observation.images.dcam_r` | video | (3, 720, 960) | depth camera right image, `dcam_right.mp4` (resized). OAK-D only, see below |
+| `observation.images.dcam_depth` | video (depth) | (1, 400, 640) | depth map, `dcam_depth.mkv`, native resolution |
 | `action` | float32 | (8,) | `[x, y, z, ax, ay, az, proximal, distal]`, next-step target |
+| `is_lost` | float32 | (1,) | SLAM tracking-lost flag (1.0 = lost), for masking |
+| `imu` | float32 | (10,) | `[ax, ay, az, wx, wy, wz, qx, qy, qz, qw]` from `dcam_imu.json`. OAK-D only, see below |
 
-Poses are gravity-aligned (Z-up). The pose component is position +
-axis-angle rotation; the gripper component is the two joint angles.
+The episodes metadata (`meta/episodes/*.parquet`) also carries, per episode,
+`depth_camera` (`oakd`, `gemini305`, `stereo_uvc` or `unknown`) and `tags`, read
+with `ds.meta.episodes[i]["depth_camera"]`. The model comes from `metadata.json`,
+else from `dcam_calib.json`, else from the OAK-only streams (IMU, right image).
+
+**OAK-D-only streams.** Only the OAK-D SR records a right image and an IMU; the
+Gemini 305 has neither. A LeRobot schema is the same for every episode, so
+`build_dataset(..., with_right=True, with_imu=True)` keeps them and skips the
+episodes without them, `False` leaves them out, and `None` (the builder's
+default) adds them only when **every** episode has them. The Space and the
+fleet pass an explicit choice: a ticked stream is kept, its missing episodes
+skipped.
+
+**IMU.** The ~200 Hz streams are resampled onto the dataset frames: accel (m/s²)
+and gyro (rad/s) are linearly interpolated, and the fused rotation (IMU body to
+gravity-aligned world) is the nearest sample. Values are in the IMU's own frame;
+timestamps use the same device→host clock fit as the SLAM input. The key has no
+`observation.` prefix, like `is_lost`, so LeRobot does not feed it to policies
+as a second state.
+
+Every stream is matched to the trajectory by nearest timestamp. Poses are
+gravity-aligned (Z-up). The pose component is position + axis-angle rotation;
+the gripper component is the two joint angles.
+
+Bimanual / role-partitioned recordings (`<recording>/{left,right}/`) use the
+same features prefixed by role: `left_cam0`, `left_dcam`, `left_dcam_r`,
+`left_dcam_depth`, `right_…`, with `action` (8 per arm), `is_lost` (1 per arm)
+and `imu` (10 per arm) concatenated in role order, and a `{role}_depth_camera`
+column per arm in the episodes metadata.
+
+#### Depth
+
+The depth map is stored as a LeRobot
+[depth stream](https://huggingface.co/docs/lerobot/en/video_encoding_parameters#depth-streams).
+Each uint16 mm frame is quantized to a 12-bit code and encoded losslessly as
+HEVC `gray12le` in an MP4. LeRobot decodes it back to depth on load, in mm by
+default or in m with `depth_output_unit="m"`.
+
+- **Alignment:** pixel-registered to the depth camera's left sensor (`dcam`),
+  in the same orientation. `dcam` itself is resized to 960×720, so scale pixel
+  coordinates between the two.
+- **Quantization** (`DEPTH_QUANTIZATION` in `grabette_postprocess/dataset.py`)
+  is tuned for grabette's close range instead of LeRobot's generic 0.01–10 m.
+  The scale is logarithmic over **0.07–3.0 m** with a ~0 shift, so precision is
+  relative (~0.09 % per code).
+- **Measured error** on Gemini 305 episodes: 0 mm below 1 m, mean 0.3 mm at
+  1–2 m and 0.5 mm at 2–3 m, max 1 mm.
+- **Saturation:** anything beyond 3 m comes back as 3 m. That is 5–10 % of
+  valid pixels in typical scenes, all background.
+- **Invalid pixels:** a raw value of 0 (no measurement, about half the pixels)
+  is stored as code 0 and decodes to `depth_min`, i.e. **70 mm**. The sensor
+  cannot measure below ~9 cm, so no valid pixel decodes that low. **Treat
+  `depth <= 0.07 m` as invalid, not as a close obstacle.** For the same reason
+  the gripper fingers, which are too close to the sensor, are mostly invalid.
+- **Settings in the dataset:** `meta/info.json` records them under the
+  feature's `info` (`video.depth_min`, `video.depth_max`, `video.shift`,
+  `video.use_log`, `is_depth_map: true`). Changing them only affects datasets
+  built afterwards.
+- **Size:** about 4.5 MB/s per arm, roughly 10× the two RGB streams together.
+  Lossy encoding was tried and rejected. Depth edges next to invalid pixels
+  ring badly, giving 1–15 cm errors and flipping many pixels between valid and
+  invalid.
+- **Training:** the depth feature is a 1-channel camera key. Policies that
+  only accept RGB need to drop it, or build the dataset with `--no-depth`.
+
+```python
+from pathlib import Path
+from lerobot.datasets import LeRobotDataset
+
+ds = LeRobotDataset("user/dataset-name", root=Path("~/lerobot_datasets").expanduser())
+depth_mm = ds[0]["observation.images.dcam_depth"]   # torch.float32 (1, 400, 640), mm
+valid = depth_mm > 70.0
+```
 
 ### 4. Push dataset to Hugging Face Hub
 

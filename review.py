@@ -11,6 +11,8 @@ so a flagged episode is only ever shown to the user whose run produced it — no
 here is module-global, precisely so nothing leaks between concurrent users.
 """
 
+import html
+
 import gradio as gr
 
 import session
@@ -41,6 +43,14 @@ def submit_review(request: gr.Request = None) -> None:
     session.get(request).review_done.set()
 
 
+def set_choice(key: str, value: str, request: gr.Request = None) -> dict:
+    """Content gate: the user picked "exclude" or "drop" for one missing feature."""
+    sess = session.get(request)
+    if value in ("exclude", "drop"):
+        sess.review_choices[key] = value
+    return sess.review_state()
+
+
 def poll(cur: dict, request: gr.Request = None):
     """gr.Timer tick: mirror this session's worker flags into its panel State so it
     opens/closes and its drop set stays in sync. Returns gr.skip() when nothing
@@ -58,6 +68,9 @@ def build_panel(review_state) -> None:
     @gr.render(inputs=review_state)
     def _render(st):
         if not st.get("open"):
+            return
+        if st.get("kind") == "content":
+            _render_content(st, review_state)
             return
         items = st["items"]
         dropped = set(st["dropped"])
@@ -96,3 +109,46 @@ def build_panel(review_state) -> None:
                 gr.Button(f"↺  Restore {len(dropped)} removed",
                           variant="secondary", size="sm").click(
                     restore_episodes, inputs=None, outputs=review_state)
+
+
+def _render_content(st: dict, review_state) -> None:
+    """Content gate: one card per ticked feature that some kept episodes lack.
+    The user must choose, for each, between adding it (and leaving out those
+    episodes) and not adding it; Continue stays disabled until every choice is
+    made. A feature no episode has is only shown as a warning."""
+    items, choices = st["items"], st.get("choices", {})
+    forced = [it for it in items if it["forced"]]
+    to_choose = len(items) - len(forced)
+    intro = ("\nFor each feature, choose whether to add it — leaving out the episodes "
+             "without it — or not to add it, then **Continue**." if to_choose else "")
+    gr.Markdown("### ⚠️ Some episodes don't have the selected optional features" + intro)
+    pending = 0
+    with gr.Column(elem_id="review-cards"):
+        for it in items:
+            names, total = it["missing"], it["total"]
+            if it["forced"]:
+                gr.HTML(
+                    '<div style="border-left:4px solid #f97316;border-radius:8px;'
+                    'padding:9px 12px;background:rgba(249,115,22,.08)">'
+                    f'<b>{html.escape(it["label"])}</b> — none of the {total} episode(s) '
+                    'has it, so it won\'t be included in the dataset.</div>')
+                continue
+            shown = ", ".join(names[:8]) + (f" … (+{len(names) - 8})" if len(names) > 8 else "")
+            arm = (" In a multi-arm recording, the whole recording is left out."
+                   if any("/" in n for n in names) else "")
+            gr.Markdown(f"**{it['label']}** — {len(names)} of {total} episode(s) "
+                        f"don't have it: {shown}.{arm}")
+            radio = gr.Radio(
+                choices=[(f"Add it, and leave out these {len(names)} episode(s)", "exclude"),
+                         ("Don't add it", "drop")],
+                value=choices.get(it["key"]), show_label=False)
+            radio.change(set_choice, inputs=[gr.State(it["key"]), radio],
+                         outputs=review_state)
+            pending += it["key"] not in choices
+    with gr.Row(elem_id="review-actions"):
+        label = (f"Choose for {pending} feature(s) to continue" if pending
+                 else "▶  Continue (run SLAM)" if to_choose
+                 else "▶  Continue anyway")
+        gr.Button(label,
+                  size="sm", elem_classes=["btn-orange"],
+                  interactive=not pending).click(submit_review, inputs=None, outputs=None)

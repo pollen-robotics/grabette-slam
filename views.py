@@ -97,9 +97,10 @@ def error_card(msg: str) -> str:
     )
 
 
-def selection_card(source="", target="", task="") -> str:
+def selection_card(source="", target="", task="", features=None) -> str:
     """Small read-only recap of the user's inputs, shown in place of the editable
-    fields while a run is in progress."""
+    fields while a run is in progress. features=None (e.g. a push retry) omits
+    that row."""
     rows = []
     if source:
         rows.append(f"Source: <code>{html.escape(source)}</code>")
@@ -107,6 +108,9 @@ def selection_card(source="", target="", task="") -> str:
         rows.append(f"Target: <code>{html.escape(target)}</code>")
     if task:
         rows.append(f"Task: {html.escape(task)}")
+    if features is not None:
+        rows.append("Optional features: " + (", ".join(html.escape(f) for f in features)
+                                             or "none"))
     return (
         '<div style="font-size:12px;color:var(--body-text-color-subdued);'
         'border:1px solid var(--border-color-primary,#e5e7eb);border-radius:8px;'
@@ -134,6 +138,18 @@ def run_recap(logs: list[str]) -> str:
     if not keep:
         return ""
     return "\n\n**Run recap**\n```\n" + "\n".join(keep) + "\n```"
+
+
+def content_recap(logs: list[str]) -> str:
+    """The "Features converted to LeRobot" section of the final card: what was kept or left out
+    of the dataset and why, lifted from the `[content]` lines that
+    pipeline.build_recordings logs before the build. "" when there are none
+    (e.g. a push-only retry)."""
+    marker = "[content] "
+    items = [ln.strip()[len(marker):] for ln in logs if ln.strip().startswith(marker)]
+    if not items:
+        return ""
+    return "\n\n**Features converted to LeRobot**\n" + "\n".join(f"- {i}" for i in items)
 
 
 def success_summary(target_repo: str, n: int, link: str | None, mode: str) -> str:
@@ -167,14 +183,20 @@ def success_summary(target_repo: str, n: int, link: str | None, mode: str) -> st
     )
 
 
+def required_filled(source, target, task) -> bool:
+    """Source, target and task all filled (whitespace doesn't count)."""
+    return all((v or "").strip() for v in (source, target, task))
+
+
 def btns(state, *, paused=False, cancel_pending=False,
-         branch=False, retry=False, allow_pause=True):
+         branch=False, retry=False, allow_pause=True, ready=True):
     """Updates for the 8 buttons, in `outputs` order:
     (branch, retry, run, pause, cancel, confirm_cancel, keep, reset).
 
     state: 'idle' (only Run, enabled), 'running' (Run greyed 'Running' + Pause +
     Cancel, or the confirm/keep pair when a cancel is pending), or 'finished'
-    (only Reset). retry reveals the retry button. branch=True is the "target already
+    (only Reset). In idle, ready=False greys Run (a required field is empty, see
+    required_filled). retry reveals the retry button. branch=True is the "target already
     exists" case: Run is replaced by the "Push to a new branch" button (primary) and
     Reset is offered so the user can edit the target instead.
     """
@@ -206,7 +228,7 @@ def btns(state, *, paused=False, cancel_pending=False,
             run_u = H
             reset_u = gr.update(visible=True)
         else:
-            run_u = gr.update(visible=True, interactive=True, value="▶  Run")
+            run_u = gr.update(visible=True, interactive=ready, value="▶  Run")
             reset_u = H
         pause_u = cancel_u = confirm_u = keep_u = H
     return (branch_u, retry_u, run_u, pause_u, cancel_u, confirm_u, keep_u, reset_u)
@@ -221,8 +243,8 @@ def io(state, bar_html, log_text):
             gr.update(value=log_text, visible=show))
 
 
-def inputs_view(state, *, source="", target="", task=""):
-    """Updates for [source, target, task, selection_card].
+def inputs_view(state, *, source="", target="", task="", features=None):
+    """Updates for [source, target, task, debug_sync, keep, selection_card].
 
     Once a run starts and until it's reset (state 'running' or 'finished') the
     editable fields are hidden and replaced by a small read-only recap card. Only
@@ -232,10 +254,10 @@ def inputs_view(state, *, source="", target="", task=""):
     fld = gr.update(visible=not hide)
     if hide:
         card = gr.update(visible=True,
-                         value=selection_card(source, target, task))
+                         value=selection_card(source, target, task, features))
     else:
         card = gr.update(visible=False)
-    return (fld, fld, fld, card)
+    return (fld, fld, fld, fld, fld, card)
 
 
 # ---- Episode-review cards -------------------------------------------------
@@ -340,6 +362,13 @@ CSS = """
 #logbox textarea {font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
                   font-size: 12px; line-height: 1.35;}
 footer {display: none !important;}
+/* The page is as wide as its widest content, and the input/output columns only
+   sit side by side once that is wide enough — otherwise they stack and the form
+   is centred. The optional-features chips + info line are wide enough on one line
+   to flip that, pushing the form to the left of an empty output column. Taking
+   the group out of the intrinsic-width computation keeps the original layout:
+   it now wraps to the column's width instead of setting it. */
+#content-keep {contain: inline-size;}
 /* Episode-review actions: orange to match the flagged-episode cards (warning),
    not the default emerald primary.
    Both `.btn-x` and `.btn-x button` are targeted because Gradio 6 puts

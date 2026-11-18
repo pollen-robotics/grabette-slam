@@ -22,8 +22,18 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 
 import session
-from pipeline import build_lerobot, episode_label, push_lerobot
-from views import bar, btns, error_card, inputs_view, io, run_recap, success_summary
+from pipeline import CONTENT_OPTIONS, build_lerobot, episode_label, push_lerobot
+from views import (
+    bar,
+    btns,
+    content_recap,
+    error_card,
+    inputs_view,
+    required_filled,
+    io,
+    run_recap,
+    success_summary,
+)
 
 # The cooperative control flags live on the caller's session (session.RunSession):
 #   stop           — abandon the run (Cancel confirmed)
@@ -178,7 +188,7 @@ def _preflight(api, source_repo, target_repo, scopes=frozenset()):
     return exists, writable, None
 
 
-def _reset_view(sess):
+def _reset_view(sess, ready=False):
     """Full reset to the idle page (clears log/summary/bar, only Run shown).
 
     Clears the UI-facing flags (pause, cancel-pending, review) but NOT stop: when
@@ -189,13 +199,13 @@ def _reset_view(sess):
     sess.pause.clear()
     sess.cancel_pending.clear()
     sess.reset_review()
-    return (*io("idle", bar(0, "ready"), ""), "", None, *btns("idle"),
+    return (*io("idle", bar(0, "ready"), ""), "", None, *btns("idle", ready=ready),
             *inputs_view("idle"))
 
 
-def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess):
-    """Streaming generator behind Run / Push-to-branch. Yields the 16-element
-    `outputs` tuple: bar, log, summary, retry_state, the 8 buttons, then the 4
+def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch, sess):
+    """Streaming generator behind Run / Push-to-branch. Yields the 18-element
+    `outputs` tuple: bar, log, summary, retry_state, the 8 buttons, then the 6
     inputs-view fields. The episode-review panel is a separate reactive @gr.render
     block (review.build_panel), not part of this tuple.
 
@@ -225,6 +235,7 @@ def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess)
     scopes = frozenset((getattr(oauth_token, "scope", "") or "").split())
 
     sess.start_run()  # fresh run: clear this session's flags
+    features = [CONTENT_OPTIONS[k] for k in (keep or []) if k in CONTENT_OPTIONS]
 
     logs: list[str] = []
     start = time.time()
@@ -245,7 +256,7 @@ def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess)
                       branch=branch, retry=retry,
                       allow_pause=not in_review),
                 *inputs_view(state, source=source_repo, target=target_repo,
-                             task=task))
+                             task=task, features=features))
 
     # ---- Pre-flight (synchronous, fast) ---------------------------------
     logs.append("Checking repo access…")
@@ -379,6 +390,31 @@ def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess)
         return _review_gate("trajectory", items,
                             [(episode_label(ep), ep) for ep, _ in results])
 
+    def content_review_cb(gaps):
+        """Called by build_lerobot after the pre-SLAM review when ticked features
+        are missing from some or all kept episodes (pipeline.content_gaps).
+        Publishes one item per feature on THIS session's panel (kind "content") and
+        blocks until the user has chosen, for each, "exclude" (keep it, leave out
+        those episodes) or "drop" (don't add it). Returns {key: choice}."""
+        items = [{"key": g["key"], "label": g["label"], "total": g["total"],
+                  "missing": [name for name, _ in g["missing"]],
+                  "forced": len(g["missing"]) == g["total"]}
+                 for g in gaps]
+        print(f"⏸ Content review: {len(items)} selected feature(s) missing from some "
+              f"or all episodes — review them, then click Continue.")
+        sess.review_kind = "content"
+        sess.review_items[:] = items
+        sess.review_choices.clear()
+        sess.review_drop.clear()
+        sess.review_done.clear()
+        sess.review.set()
+        while not sess.review_done.is_set():
+            if sess.stop.is_set():
+                break
+            time.sleep(0.2)
+        sess.review.clear()
+        return dict(sess.review_choices)
+
     def worker():
         writer = _LineQueueWriter(q)
         try:
@@ -406,7 +442,8 @@ def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess)
                     raw, target_repo, task, root=ds_root,
                     log=print, should_stop=sess.stop.is_set, to_branch=to_branch,
                     on_progress=on_progress, token=token, gate=sess.wait_if_paused,
-                    pre_review=pre_review_cb, review=review_cb, run_sync=run_sync)
+                    pre_review=pre_review_cb, review=review_cb, run_sync=run_sync,
+                    keep=list(keep or []), content_review=content_review_cb)
                 # Build done — dataset cached on disk; record it so that if the push
                 # fails, the "Retry push" button can reuse it (no re-running SLAM).
                 result["built"] = {"root": str(ds_root), "n": len(built)}
@@ -452,7 +489,8 @@ def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess)
                 f"Push failed: {err}\n\nThe dataset is built and cached — click "
                 f"“Retry push” to push it again without re-running SLAM.")
             label = "push failed"
-            yield view(summary=msg + run_recap(logs), state="finished", retry=True)
+            yield view(summary=msg + content_recap(logs) + run_recap(logs),
+                       state="finished", retry=True)
         else:
             label = "failed"
             yield view(summary=error_card(f"Pipeline failed: {err}") + run_recap(logs),
@@ -464,7 +502,8 @@ def _run(source_repo, target_repo, task, run_sync, oauth_token, to_branch, sess)
     mode = result.get("mode")
     logs.append(f"✅ Done — {n} episode(s).")
     frac, label = 1.0, "done"
-    yield view(summary=success_summary(target_repo, n, link, mode) + run_recap(logs),
+    yield view(summary=success_summary(target_repo, n, link, mode) + content_recap(logs)
+                       + run_recap(logs),
                state="finished")
 
 
@@ -489,7 +528,7 @@ def retry_push(retry_ctx, oauth_token: gr.OAuthToken | None = None,
         return "\n".join(logs)
 
     def view(summary="", *, state="running", retry=False, ctx=retry_ctx):
-        # 16-output shape, same as _run. A push can't be paused, so allow_pause
+        # 18-output shape, same as _run. A push can't be paused, so allow_pause
         # is False; Cancel still works (abandons the retry).
         return (*io(state, bar(frac, f"{label} · {int(time.time() - start)}s"), render()),
                 summary, ctx,
@@ -558,21 +597,36 @@ def retry_push(retry_ctx, oauth_token: gr.OAuthToken | None = None,
                state="finished", ctx=None)
 
 
-def run_pipeline(source_repo, target_repo, task, run_sync=False,
+def run_pipeline(source_repo, target_repo, task, run_sync=False, keep=None,
                  oauth_token: gr.OAuthToken | None = None,
                  request: gr.Request = None):
-    yield from _run(source_repo, target_repo, task, run_sync, oauth_token,
+    yield from _run(source_repo, target_repo, task, run_sync, keep, oauth_token,
                     to_branch=False, sess=session.get(request))
 
 
-def run_pipeline_branch(source_repo, target_repo, task, run_sync=False,
+def run_pipeline_branch(source_repo, target_repo, task, run_sync=False, keep=None,
                         oauth_token: gr.OAuthToken | None = None,
                         request: gr.Request = None):
-    yield from _run(source_repo, target_repo, task, run_sync, oauth_token,
+    yield from _run(source_repo, target_repo, task, run_sync, keep, oauth_token,
                     to_branch=True, sess=session.get(request))
 
 
-def reset(request: gr.Request = None):
+def reset(source="", target="", task="", request: gr.Request = None):
     """Reset button (shown when finished): clear the page and return to idle
     (only Run). Inputs (source/target/task) are kept so the user can re-run."""
-    return _reset_view(session.get(request))
+    return _reset_view(session.get(request),
+                       ready=required_filled(source, target, task))
+
+
+def signed_in_view(profile: gr.OAuthProfile | None = None):
+    """Page load: show the form only when signed in."""
+    on = profile is not None
+    return (gr.update(size="sm" if on else "lg",
+                      variant="secondary" if on else "primary"),
+            gr.update(visible=not on),
+            gr.update(visible=on))
+
+
+def run_ready(source, target, task):
+    """Grey Run out until the required fields are filled."""
+    return gr.update(interactive=required_filled(source, target, task))

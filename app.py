@@ -11,7 +11,7 @@ per browser session, so concurrent users never see each other's run or its flagg
 episodes.
 
 REST API (called by grabette devices):
-  POST /api/process  {source_repo, target_repo, task}  Authorization: Bearer <hf_token>  → {job_id}
+  POST /api/process  {source_repo, target_repo, task[, keep]}  Authorization: Bearer <hf_token>  → {job_id}
   GET  /api/status/{job_id}                                      → {status, log, error}
   GET  /api/quality/{target_repo}   (no auth, like /api/status)   → {status, quality, flagged, …}
 
@@ -33,12 +33,15 @@ from huggingface_hub import HfApi, snapshot_download
 from pydantic import BaseModel
 
 import review
+from pipeline import CONTENT_OPTIONS, content_kwargs
 from views import CSS, THEME, bar, space_banner, visualizer_url
 from controller import (
     confirm_cancel,
     keep_running,
     request_cancel,
     reset,
+    run_ready,
+    signed_in_view,
     retry_push,
     run_pipeline,
     run_pipeline_branch,
@@ -75,44 +78,59 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
     with gr.Row():
         # ---- Inputs (left) ----
         with gr.Column(scale=2, min_width=280):
-            gr.LoginButton(size="sm")
-            source = gr.Textbox(label="Source dataset", info="raw Grabette repo on the Hub",
-                                placeholder="pollen-robotics/grabette-raw")
-            target = gr.Textbox(label="Target dataset", info="repo to create or contribute to",
-                                placeholder="your-account/grabette-dataset")
-            task = gr.Textbox(label="Task description", placeholder="cup grasping")
-            # Sync checks (depth-cam↔gyro pre-SLAM, image↔trajectory post-SLAM) are a
-            # debug-only diagnostic — off by default so a normal run skips them.
-            debug_sync = gr.Checkbox(
-                label="Run sync checks (debug)", value=False,
-                info="Extra camera↔IMU / image↔trajectory timing diagnostics")
-            # Read-only recap of the inputs, shown in their place while running.
-            selection_card = gr.HTML(visible=False)
-            # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
-            # Finished: only Reset. All visibility is driven by the generators.
-            with gr.Row():
-                run_btn = gr.Button("▶  Run", variant="primary", scale=2)
-                pause_btn = gr.Button("⏸  Pause", variant="secondary",
-                                      scale=1, visible=False)
-                cancel_btn = gr.Button("✕  Cancel", variant="stop",
-                                       scale=1, visible=False)
-            # Cancel confirmation (revealed by Cancel; replaces Pause/Cancel).
-            with gr.Row():
-                confirm_cancel_btn = gr.Button("✓  Confirm cancel", variant="stop",
-                                               size="sm", visible=False)
-                keep_btn = gr.Button("Keep running", variant="secondary",
-                                     size="sm", visible=False)
-            # Revealed (as the primary action, replacing Run) only when the target
-            # dataset already exists (see the controller).
-            confirm_branch_btn = gr.Button("⎇  Push to a new branch",
-                                           variant="primary", visible=False)
-            # Revealed only when a build succeeded but the push failed.
-            retry_btn = gr.Button("⟳  Retry push", variant="secondary",
-                                  size="sm", visible=False)
-            # Shown once a run reaches a terminal state.
-            reset_btn = gr.Button("↺  Reset", variant="secondary", visible=False)
-            # Holds the built-but-unpushed dataset context for retry_push.
-            retry_state = gr.State(None)
+            # Form shown only once signed in (see signed_in_view).
+            login_btn = gr.LoginButton(size="lg", variant="primary")
+            signin_hint = gr.Markdown(
+                "Sign in with your Hugging Face account to process a dataset.")
+            with gr.Column(visible=False, elem_id="signed-in-form") as signed_in_form:
+                source = gr.Textbox(label="Source dataset *", info="raw Grabette repo on the Hub",
+                                    placeholder="pollen-robotics/grabette-raw")
+                target = gr.Textbox(label="Target dataset *", info="repo to create or contribute to",
+                                    placeholder="your-account/grabette-dataset")
+                task = gr.Textbox(label="Task description *", placeholder="cup grasping")
+                # Sync checks (depth-cam↔gyro pre-SLAM, image↔trajectory post-SLAM) are a
+                # debug-only diagnostic — off by default so a normal run skips them.
+                debug_sync = gr.Checkbox(
+                    label="Run sync checks (debug)", value=False,
+                    info="Extra camera↔IMU / image↔trajectory timing diagnostics")
+                # Optional dataset content. If some episodes lack a ticked stream, the
+                # run asks before the build (content review): add it and leave those
+                # episodes out, or don't add it.
+                keep = gr.CheckboxGroup(
+                    label="Optional features to convert to LeRobot", elem_id="content-keep",
+                    choices=[(label, key) for key, label in CONTENT_OPTIONS.items()],
+                    value=list(CONTENT_OPTIONS),
+                    info="If some episodes lack a ticked stream, you'll choose before the "
+                         "build: add it (leaving them out) or not.")
+                # Read-only recap of the inputs, shown in their place while running.
+                selection_card = gr.HTML(visible=False)
+                # Idle: only Run. Running: Run greyed to 'Running', + Pause + Cancel.
+                # Finished: only Reset. All visibility is driven by the generators.
+                with gr.Row():
+                    # Greyed until the required fields are filled.
+                    run_btn = gr.Button("▶  Run", variant="primary", scale=2,
+                                        interactive=False)
+                    pause_btn = gr.Button("⏸  Pause", variant="secondary",
+                                          scale=1, visible=False)
+                    cancel_btn = gr.Button("✕  Cancel", variant="stop",
+                                           scale=1, visible=False)
+                # Cancel confirmation (revealed by Cancel; replaces Pause/Cancel).
+                with gr.Row():
+                    confirm_cancel_btn = gr.Button("✓  Confirm cancel", variant="stop",
+                                                   size="sm", visible=False)
+                    keep_btn = gr.Button("Keep running", variant="secondary",
+                                         size="sm", visible=False)
+                # Revealed (as the primary action, replacing Run) only when the target
+                # dataset already exists (see the controller).
+                confirm_branch_btn = gr.Button("⎇  Push to a new branch",
+                                               variant="primary", visible=False)
+                # Revealed only when a build succeeded but the push failed.
+                retry_btn = gr.Button("⟳  Retry push", variant="secondary",
+                                      size="sm", visible=False)
+                # Shown once a run reaches a terminal state.
+                reset_btn = gr.Button("↺  Reset", variant="secondary", visible=False)
+                # Holds the built-but-unpushed dataset context for retry_push.
+                retry_state = gr.State(None)
         # ---- Outputs (right) ----
         with gr.Column(scale=3, min_width=280):
             # Bar + log are revealed only while a run is in progress (running /
@@ -139,18 +157,24 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
     # Order MUST match the generators' yields (views.io → bar, log; then summary,
     # retry_state; then views.btns → branch, retry, run, pause, cancel,
     # confirm_cancel, keep, reset; then views.inputs_view → source, target, task,
-    # selection_card). The review panel is reactive, NOT in this list.
+    # debug_sync, keep, selection_card). The review panel is reactive, NOT in this list.
     outputs = [bar_out, log_out, summary_out, retry_state,
                confirm_branch_btn, retry_btn,
                run_btn, pause_btn, cancel_btn, confirm_cancel_btn, keep_btn, reset_btn,
-               source, target, task, selection_card]
-    run_event = run_btn.click(run_pipeline, inputs=[source, target, task, debug_sync],
+               source, target, task, debug_sync, keep, selection_card]
+    run_event = run_btn.click(run_pipeline, inputs=[source, target, task, debug_sync, keep],
                               outputs=outputs)
     branch_event = confirm_branch_btn.click(run_pipeline_branch,
-                                            inputs=[source, target, task, debug_sync],
+                                            inputs=[source, target, task, debug_sync, keep],
                                             outputs=outputs)
     retry_event = retry_btn.click(retry_push, inputs=[retry_state], outputs=outputs)
-    reset_btn.click(reset, inputs=None, outputs=outputs)
+    demo.load(signed_in_view, inputs=None,
+              outputs=[login_btn, signin_hint, signed_in_form])
+    reset_btn.click(reset, inputs=[source, target, task], outputs=outputs)
+    # Run follows the required fields as they're edited.
+    for _fld in (source, target, task):
+        _fld.change(run_ready, inputs=[source, target, task], outputs=run_btn,
+                    show_progress="hidden")
     # Pause/Resume + cancel-confirm just flip cooperative flags; the running
     # generator re-renders the buttons from them on its next tick (outputs=None
     # → these never write the same components as the stream, so no conflict).
@@ -168,7 +192,7 @@ with gr.Blocks(title="Grabette SLAM → LeRobot") as demo:
     cancel_evt = confirm_cancel_btn.click(
         confirm_cancel, inputs=None, outputs=None,
         cancels=[run_event, branch_event, retry_event])
-    cancel_evt.then(reset, inputs=None, outputs=outputs)
+    cancel_evt.then(reset, inputs=[source, target, task], outputs=outputs)
 
 
 # ── REST API for grabette devices ────────────────────────────────────────────
@@ -216,6 +240,9 @@ class _ProcessReq(BaseModel):
     # relay; a caller too old to send it still gets the same behaviour by naming the
     # target repo with SLAM_CHECK_MARKER (or the legacy prefix).
     check_only: bool = False
+    # Optional dataset content to keep: any of CONTENT_OPTIONS' keys ("depth",
+    # "right", "imu"). Omitted → everything, so existing callers are unchanged.
+    keep: list[str] | None = None
 
 
 def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
@@ -226,7 +253,8 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                             run_sync: bool = False,
                             roles: list[str] | None = None,
                             keep_raw: bool = True,
-                            check_only: bool = False) -> None:
+                            check_only: bool = False,
+                            keep: list[str] | None = None) -> None:
     """Run the pipeline synchronously in a background thread.
 
     exclude_fail: drop episodes with trajectory verdict FAIL.
@@ -382,7 +410,8 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                     # original single-arm schema.
                     report_by_ep = {ep: rep for ep, rep in slam_results}
                     built = build_recordings(target_repo, task, ds_root, kept,
-                                             report_by_ep, roles=roles, log=log)
+                                             report_by_ep, roles=roles, log=log,
+                                             keep=keep)
                     n_built = len(built)
                     n, link, _mode = push_lerobot(target_repo, task, ds_root,
                                                   n_built, token=token, log=log,
@@ -427,6 +456,10 @@ async def api_process(req: _ProcessReq, authorization: str | None = Header(defau
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <hf_token>")
     token = authorization[len("Bearer "):].strip()
+    try:
+        content_kwargs(req.keep)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     job_id = uuid.uuid4().hex[:12]
     target_repo = req.target_repo.strip()
     # check_only is the explicit path, and the fleet now sends it: the device relay
@@ -448,7 +481,8 @@ async def api_process(req: _ProcessReq, authorization: str | None = Header(defau
               req.task.strip(), token),
         kwargs={"exclude_fail": req.exclude_fail, "exclude_bad": req.exclude_bad,
                 "private": req.private, "run_sync": req.run_sync, "roles": req.roles,
-                "keep_raw": req.keep_raw, "check_only": check_only},
+                "keep_raw": req.keep_raw, "check_only": check_only,
+                "keep": req.keep},
         daemon=True,
     )
     t.start()
