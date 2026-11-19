@@ -28,6 +28,7 @@ from .bimanual import to_grip_relative, track_bimanual
 from .board_calibrate import calibrate_board
 from .charuco_pose import charuco_pose
 from .cube_track_offline import track_cube
+from .urdf_frames import frame_from_urdf
 
 __all__ = [
     "calibrate_board",
@@ -35,15 +36,29 @@ __all__ = [
     "track_bimanual",
     "to_grip_relative",
     "charuco_pose",
+    "frame_from_urdf",
     "load_fisheye_intrinsics",
     "default_intrinsics_path",
     "default_calib_path",
+    "default_urdf_path",
 ]
 
 
 def default_intrinsics_path() -> Path:
     """Path to the packaged casquette fisheye intrinsics JSON."""
     return Path(__file__).parent / "data" / "casquette_camera_intrinsics.json"
+
+
+def default_urdf_path(side: str) -> Path:
+    """Path to a vendored grabette URDF ('left'/'right').
+
+    A reference copy of the device URDF (authoritative home: pollen-robotics/
+    grabette). Carries the fixed `aruco` frame, so `frame_from_urdf(path,
+    "dcam_left", "aruco")` yields each hand's cube extrinsic.
+    """
+    if side not in ("left", "right"):
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+    return Path(__file__).parent / "data" / "urdf" / f"grabette_{side}.urdf"
 
 
 def default_calib_path(block: int) -> Path:

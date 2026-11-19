@@ -111,6 +111,47 @@ def test_bimanual_se3_helpers_roundtrip():
     np.testing.assert_allclose(recon, TR, atol=1e-9)
 
 
+def test_frame_from_urdf_chains_fixed_joints(tmp_path):
+    """T_dcam_left<-aruco composes through the URDF tree; roll about X is preserved."""
+    from grabette_postprocess.aruco_cube import frame_from_urdf
+    from scipy.spatial.transform import Rotation as Rot
+
+    # root 'grip' with two fixed children: dcam_left (pure offset) and aruco
+    # (offset + 90 deg roll about X). Expect T_dcam_left<-aruco = inv(Td) @ Ta.
+    urdf = tmp_path / "r.urdf"
+    urdf.write_text("""<robot name="t">
+      <link name="grip"/><link name="dcam_left"/><link name="aruco"/>
+      <joint name="d" type="fixed"><parent link="grip"/><child link="dcam_left"/>
+        <origin xyz="0.1 0 0" rpy="0 0 0"/></joint>
+      <joint name="a" type="fixed"><parent link="grip"/><child link="aruco"/>
+        <origin xyz="0 0.2 0.3" rpy="1.5707963 0 0"/></joint>
+    </robot>""")
+    T = frame_from_urdf(str(urdf), "dcam_left", "aruco")
+    # expected: translation = aruco_xyz - dcam_xyz (same orientation parent), rot = Rx(90)
+    np.testing.assert_allclose(T[:3, 3], [-0.1, 0.2, 0.3], atol=1e-6)
+    np.testing.assert_allclose(T[:3, :3], Rot.from_euler("x", np.pi / 2).as_matrix(), atol=1e-6)
+
+    with pytest.raises(ValueError):
+        # a frame not in the tree has itself as root -> disjoint from dcam_left's root
+        frame_from_urdf(str(urdf), "dcam_left", "nonexistent")
+
+
+def test_vendored_urdf_dcam_left_to_aruco():
+    """The shipped grabette URDFs give the known T_dcam_left<-aruco per hand."""
+    from grabette_postprocess.aruco_cube import default_urdf_path, frame_from_urdf
+    from scipy.spatial.transform import Rotation as Rot
+
+    expect = {  # (xyz, roll about X) computed from the OnShape exports
+        "left":  ([-0.009000, -0.061848, -0.077132], 2.792530),
+        "right": ([+0.027000, -0.061848, -0.077132], 2.792530),
+    }
+    for side, (xyz, roll) in expect.items():
+        T = frame_from_urdf(str(default_urdf_path(side)), "dcam_left", "aruco")
+        np.testing.assert_allclose(T[:3, 3], xyz, atol=1e-5)
+        rpy = Rot.from_matrix(T[:3, :3]).as_euler("xyz")
+        np.testing.assert_allclose(rpy, [roll, 0.0, 0.0], atol=1e-5)
+
+
 def test_to_grip_relative_identity_extrinsics():
     """With identity grip<-cube extrinsics, hand-relative == cube-relative."""
     from grabette_postprocess.aruco_cube import bimanual as bm

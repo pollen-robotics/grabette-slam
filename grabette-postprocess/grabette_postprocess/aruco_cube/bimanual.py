@@ -94,8 +94,10 @@ def to_grip_relative(pair: dict, T_gripL_cubeL: np.ndarray,
     """Extend one bimanual pair to hand-to-hand, given fixed grip<-cube extrinsics.
 
     T_gripL<-gripR = inverse(T_C<-gripL) @ T_C<-gripR, with
-    T_C<-grip = T_C<-cube @ inverse(T_grip<-cube).  Use once the URDF aruco_frame
-    (left is pending) supplies both extrinsics as 4x4 transforms.
+    T_C<-grip = T_C<-cube @ inverse(T_grip<-cube).  The grabette origin / SLAM
+    frame is the depth-left lens, so pass each hand's
+    `frame_from_urdf(urdf, "dcam_left", "aruco")` (= T_dcam_left<-aruco) and the
+    result is T_dcamL<-dcamR, i.e. relative hand pose in the same frame SLAM uses.
     """
     T_C_gripL = pose_to_mat(pair["T_C_cubeL"]) @ invert(T_gripL_cubeL)
     T_C_gripR = pose_to_mat(pair["T_C_cubeR"]) @ invert(T_gripR_cubeR)
