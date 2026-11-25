@@ -134,6 +134,19 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
     # never uploaded) — skip it here rather than deep inside the builder, so the
     # returned count matches what is actually written.
     groups = pair_episodes_by_role(episodes)
+    # Attach casquette OBSERVER arms: camera-only, never SLAM'd (find_episode_dirs
+    # anchors on oakd_left.mp4), so they're absent from `episodes`. Each recording's
+    # casquette stream sits at {episode_id}/casquette/ alongside the SLAM arms.
+    casquette_found = False
+    for group in groups.values():
+        if not group:
+            continue
+        cdir = next(iter(group.values())).parent / "casquette"
+        if cdir.is_dir() and (cdir / "raw_video.mp4").is_file():
+            group["casquette"] = cdir
+            casquette_found = True
+    if casquette_found and "casquette" not in roles:
+        roles = [*roles, "casquette"]
     for ep_id in sorted(groups):
         missing = [r for r in roles if r not in groups[ep_id]]
         if missing:
@@ -143,9 +156,10 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
         raise RuntimeError(
             f"No recording has all the arms ({'+'.join(roles)}) — nothing to push.")
     # Tags keyed by recording id, prefixed by role so filtering stays attributable
-    # per arm (e.g. left_tracking_lost).
+    # per arm (e.g. left_tracking_lost). Observer arms (casquette) have no SLAM
+    # report, so they contribute no tags.
     tags_by_recording = {
-        ep_id: [f"{role}_{t}" for role in sorted(group)
+        ep_id: [f"{role}_{t}" for role in sorted(group) if role not in ("casquette",)
                 for t in episode_tags(group[role], report_by_ep.get(group[role]))]
         for ep_id, group in groups.items()
     }
