@@ -656,6 +656,25 @@ def _load_arm_streams(ep_dir: Path, image_size: tuple[int, int],
     }
 
 
+# Camera-only "observer" arms: they contribute a POV video observation but have
+# no SLAM trajectory / gripper, so no action or is_lost. (The casquette watches
+# the scene; the eventual ArUco fusion consumes its RAW stream separately.)
+OBSERVER_ROLES = ("casquette",)
+
+
+def _load_observer_streams(ep_dir: Path, image_size: tuple[int, int]) -> dict:
+    """Load a camera-only observer arm (e.g. casquette): its POV video + per-frame
+    timestamps + capture-start clock. No trajectory/action — it's sampled onto the
+    reference (SLAM) arm's timeline via capture_started, like the SLAM cameras."""
+    ep_dir = Path(ep_dir).absolute()
+    return {
+        "dir": ep_dir,
+        "cam_path": ep_dir / "raw_video.mp4",
+        "cam_ts": _load_video_timestamps(ep_dir, ep_dir / "raw_video.mp4"),
+        "started": _load_capture_started(ep_dir),
+    }
+
+
 def build_dataset_multi(
     repo_id: str,
     groups: dict[str, dict[str, Path]],
@@ -698,7 +717,14 @@ def build_dataset_multi(
         print(f"Using default fps: {int(fps)}")
     h, w = image_size
 
-    arm_dirs = [Path(g[r]) for g in groups.values() for r in roles if r in g]
+    slam_roles = [r for r in roles if r not in OBSERVER_ROLES]
+    obs_roles = [r for r in roles if r in OBSERVER_ROLES]
+    if not slam_roles:
+        raise RuntimeError(
+            f"build_dataset_multi needs at least one SLAM arm; got only {obs_roles}")
+
+    # Optional streams (dcam_r, IMU) only concern SLAM arms: observers are camera-only.
+    arm_dirs = [Path(g[r]) for g in groups.values() for r in slam_roles if r in g]
     with_right = _optional_stream_policy(
         "dcam_r", with_right, [_has_right(d) for d in arm_dirs])
     with_imu = _optional_stream_policy(
@@ -706,7 +732,7 @@ def build_dataset_multi(
     sides = ("left", "right") if with_right else ("left",)
 
     features: dict = {}
-    for role in roles:
+    for role in slam_roles:
         for cam in ("cam0", *(DCAM_KEYS[s] for s in sides)):
             features[f"observation.images.{role}_{cam}"] = {
                 "dtype": "video", "shape": (3, h, w),
@@ -714,19 +740,25 @@ def build_dataset_multi(
             }
         if with_depth:
             features[f"observation.images.{role}_dcam_depth"] = _depth_feature(depth_size)
-    per =["x", "y", "z", "ax", "ay", "az", "proximal", "distal"]
+    # Observer arms (e.g. casquette): a single POV camera, no action/state.
+    for role in obs_roles:
+        features[f"observation.images.{role}"] = {
+            "dtype": "video", "shape": (3, h, w),
+            "names": ["channels", "height", "width"],
+        }
+    per = ["x", "y", "z", "ax", "ay", "az", "proximal", "distal"]
     features["action"] = {
-        "dtype": "float32", "shape": (8 * len(roles),),
-        "names": [f"{r}_{n}" for r in roles for n in per],
+        "dtype": "float32", "shape": (8 * len(slam_roles),),
+        "names": [f"{r}_{n}" for r in slam_roles for n in per],
     }
     features["is_lost"] = {
-        "dtype": "float32", "shape": (len(roles),),
-        "names": [f"{r}_is_lost" for r in roles],
+        "dtype": "float32", "shape": (len(slam_roles),),
+        "names": [f"{r}_is_lost" for r in slam_roles],
     }
     if with_imu:
         features["imu"] = {
-            "dtype": "float32", "shape": (len(IMU_NAMES) * len(roles),),
-            "names": [f"{r}_{n}" for r in roles for n in IMU_NAMES],
+            "dtype": "float32", "shape": (len(IMU_NAMES) * len(slam_roles),),
+            "names": [f"{r}_{n}" for r in slam_roles for n in IMU_NAMES],
         }
 
     dataset = LeRobotDataset.create(
@@ -737,9 +769,16 @@ def build_dataset_multi(
         streaming_encoding=True,
     )
 
-    ref_role = roles[0]
+    # The reference timeline must be a SLAM arm (observers have no trajectory).
+    ref_role = slam_roles[0]
     saved: list[str] = []
-    camera_columns: dict[str, dict[str, str]] = {f"{r}_depth_camera": {} for r in roles}
+    camera_columns: dict[str, dict[str, str]] = {
+        f"{r}_depth_camera": {} for r in slam_roles}
+
+    def _timeline(a):
+        """An arm's own time axis: SLAM trajectory ts, or observer video ts."""
+        return a["cam_ts"] if "cam_ts" in a else a["traj_ts"]
+
     for ep_id in sorted(groups):
         group = groups[ep_id]
         missing = [r for r in roles if r not in group]
@@ -748,8 +787,12 @@ def build_dataset_multi(
             continue
         print(f"\nProcessing {ep_id} ({'+'.join(roles)})...")
         try:
-            arms = {r: _load_arm_streams(group[r], image_size, with_depth,
-                                         with_right, with_imu) for r in roles}
+            arms = {
+                r: (_load_observer_streams(group[r], image_size) if r in OBSERVER_ROLES
+                    else _load_arm_streams(group[r], image_size, with_depth,
+                                           with_right, with_imu))
+                for r in roles
+            }
         except ValueError as e:
             if not (with_right or with_imu):
                 raise  # left/depth/trajectory missing: a broken arm, as before
@@ -771,11 +814,10 @@ def build_dataset_multi(
         # [first,last] on its own clock → [first - delta_r, last - delta_r] in
         # reference time. Keeping only reference frames inside the intersection
         # means every arm is sampled within its REAL range (no frozen first/last
-        # frame) and all arms get the SAME length (the overlap). With a
-        # synchronized start the low bound is ~0, so this effectively just cuts
-        # the longer arm's tail; it also guards the start if starts ever differ.
-        lo = max([full_ref_ts[0]] + [arms[r]["traj_ts"][0] - deltas[r] for r in roles])
-        hi = min([full_ref_ts[-1]] + [arms[r]["traj_ts"][-1] - deltas[r] for r in roles])
+        # frame) and all arms get the SAME length (the overlap). Observers use
+        # their video timeline in place of a trajectory.
+        lo = max([full_ref_ts[0]] + [_timeline(arms[r])[0] - deltas[r] for r in roles])
+        hi = min([full_ref_ts[-1]] + [_timeline(arms[r])[-1] - deltas[r] for r in roles])
         ref_ts = full_ref_ts[(full_ref_ts >= lo) & (full_ref_ts <= hi)]
         n_frames = len(ref_ts)
         if n_frames == 0:
@@ -792,6 +834,11 @@ def build_dataset_multi(
         for r in roles:
             a = arms[r]
             q = ref_ts + deltas[r]
+            if r in OBSERVER_ROLES:
+                cam_idx = _nearest_frame_indices(q, a["cam_ts"])
+                per_role[r] = {"": (cam_idx, _load_video_frames_indexed(
+                    a["cam_path"], image_size, set(cam_idx.tolist())))}
+                continue
             traj_idxs[r] = _nearest_frame_indices(q, a["traj_ts"])
             streams = {}
             cam0_idx = _nearest_frame_indices(q, a["cam0_ts"])
@@ -815,17 +862,22 @@ def build_dataset_multi(
             frame: dict = {"task": task}
             act_parts, lost_parts, imu_parts = [], [], []
             ok = True
-            for r in roles:
+            # Observer arms first (a single POV image each, no action/state), then
+            # SLAM arms (cameras + 8D action + is_lost [+ IMU]) in slam_roles order.
+            for r in obs_roles + slam_roles:
                 for name, (idx, cache) in per_role[r].items():
                     img = cache.get(idx[i])
                     if img is None:
                         ok = False
                         break
-                    frame[f"observation.images.{r}_{name}"] = (
+                    key = f"observation.images.{r}_{name}" if name else f"observation.images.{r}"
+                    frame[key] = (
                         img if name == "dcam_depth"  # uint16 mm
                         else cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 if not ok:
                     break
+                if r in OBSERVER_ROLES:
+                    continue
                 ti = traj_idxs[r][i]
                 act_parts.append(arms[r]["actions"][ti])
                 lost_parts.append(arms[r]["is_lost"][ti])
@@ -846,9 +898,9 @@ def build_dataset_multi(
             continue
         dataset.save_episode()
         saved.append(ep_id)
-        for r in roles:
+        for r in slam_roles:
             camera_columns[f"{r}_depth_camera"][ep_id] = arms[r]["depth_camera"]
-        cams = ", ".join(f"{r}={arms[r]['depth_camera']}" for r in roles)
+        cams = ", ".join(f"{r}={arms[r]['depth_camera']}" for r in slam_roles)
         print(f"  Saved episode {ep_id}: {wrote} frames (depth camera: {cams})")
 
     dataset.finalize()
