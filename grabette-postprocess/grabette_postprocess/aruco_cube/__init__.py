@@ -13,6 +13,9 @@ Two-step use per cube:
   2. `track_cube(clip, intrinsics, calib)` — per episode: the offline-quality
      tracker, returns per-frame T_C<-cube.
 
+`fuse_recording(arms, casquette_dir)` / `fuse(hands)` (slam_fusion) put every
+grabette SLAM segment in one world via the cubes and fill tracking gaps.
+
 `charuco_pose` gives T_C<-charuco from the static calibration board — a fixed-world
 anchor used to validate the merge without casquette VIO.
 
@@ -28,6 +31,7 @@ from .bimanual import to_grip_relative, track_bimanual
 from .board_calibrate import calibrate_board
 from .charuco_pose import charuco_pose
 from .cube_track_offline import track_cube
+from .slam_fusion import HandTrack, fuse, fuse_recording
 from .urdf_frames import frame_from_urdf
 
 __all__ = [
@@ -37,6 +41,9 @@ __all__ = [
     "to_grip_relative",
     "charuco_pose",
     "frame_from_urdf",
+    "HandTrack",
+    "fuse",
+    "fuse_recording",
     "load_fisheye_intrinsics",
     "default_intrinsics_path",
     "default_calib_path",

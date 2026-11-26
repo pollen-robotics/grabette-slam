@@ -105,6 +105,14 @@ is a per-cube gate.
 2. Composition helper: `robot.urdf` + `poses.json` → `T_C←grip(t)`; print marker-0-vs-CAD
    residual (nominal validation).
 3. Tier 0 single-hand gap fill; measure seam error on real gaps.
+   **[in progress]** `aruco_cube/slam_fusion.py` implements steps 1-3 and 5 (merge in
+   one SLAM world, not `C`): each tracked SLAM run is a segment with its own world;
+   cross edges (both cubes seen) and Tier-0 bridge edges are estimated robustly
+   (RANSAC + chordal mean), segments registered into the reference hand's first
+   world, lost frames filled (`cube_direct` > `cube_head` > `interp` > `held`),
+   seams blended, cube-less segments chained by continuity (`slam_aligned`).
+   `fuse_recording()` / `python -m grabette_postprocess.aruco_cube.slam_fusion <rec>`
+   writes `camera_trajectory_fused.csv` per arm + `aruco_fusion_report.json`.
 4. Decide Tier 1 (needs casquette IMU answer + gap stats).
 5. Bimanual merge in `C`; then Tier 2 if seams require it.
 6. Wire into the postprocess pipeline.
