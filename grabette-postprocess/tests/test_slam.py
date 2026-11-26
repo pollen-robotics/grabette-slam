@@ -35,3 +35,29 @@ def test_broken_imu_data_keeps_the_error(tmp_path, capsys):
     _gravity_align_trajectory(_traj(), tmp_path)
     log = capsys.readouterr().out
     assert "no IMU gravity" in log and "imu_to_cam" in log
+
+
+def test_slam_command_omits_countdown_by_default(tmp_path):
+    from grabette_postprocess.slam import _slam_command
+    cmd = _slam_command(tmp_path, docker_image="img", binary=None)
+    assert "--odom-reset-countdown" not in cmd
+
+
+def test_slam_command_passes_countdown_docker_and_binary(tmp_path):
+    from grabette_postprocess.slam import _slam_command
+    docker = _slam_command(tmp_path, docker_image="img", binary=None,
+                           odom_reset_countdown=5)
+    assert docker[-2:] == ["--odom-reset-countdown", "5"]
+    assert docker[docker.index("img") + 1:][:2] == ["/data", "/data/poses.csv"]
+    native = _slam_command(tmp_path, docker_image="img", binary="/bin/vslam",
+                           odom_reset_countdown=0)
+    assert native == ["/bin/vslam", str(tmp_path), str(tmp_path / "poses.csv"),
+                      "--odom-reset-countdown", "0"]
+
+
+def test_run_slam_rejects_negative_countdown(tmp_path):
+    import pytest
+    from grabette_postprocess.slam import run_slam
+    (tmp_path / "slam_input").mkdir()
+    with pytest.raises(ValueError):
+        run_slam(tmp_path, odom_reset_countdown=-1, show_progress=False)
