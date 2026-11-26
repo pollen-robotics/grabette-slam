@@ -30,6 +30,8 @@ remains at the seams; seam sizes are reported as a quality signal):
                  the nearest known pose (keeps its shape, as raw SLAM would)
     interp       SE3 interpolation between this hand's known poses
     held         nothing better: last (or first) known pose held
+    unregistered the hand has no link to the reference at all: raw SLAM poses,
+                 left in that hand's own world (NOT the common frame)
 
 Pure numpy/scipy, no IO: `fuse()` takes arrays on a common clock. See
 `fuse_episode` / the CLI at the bottom for the recording-directory wrapper, and
@@ -43,7 +45,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
-SOURCES = ("slam", "slam_aligned", "cube_direct", "cube_head", "interp", "held")
+SOURCES = ("slam", "slam_aligned", "cube_direct", "cube_head", "interp", "held",
+           "unregistered")
 
 
 # --------------------------------------------------------------------- SE3 utils
@@ -436,7 +439,10 @@ def fuse(hands: dict[str, HandTrack], ref: str | None = None, *,
                 T_out[i] = T_out[prev[-1] if len(prev) else known[0]]
                 src[i] = "held"
         elif len(rest):
-            src[rest] = "held"     # nothing registered at all: identity
+            # no link at all to the reference world (e.g. the other hand's cube
+            # never seen): keep this hand's raw SLAM, in its OWN world
+            T_out[:] = hd.T_W_S
+            src[:] = "unregistered"
         out[h] = FusedHand(t=hd.t, T_ref_S=T_out, source=src.astype(str), segment=seg_id)
 
     return FusionResult(ref=root, hands=out, registration=registration, edges=edges,
@@ -484,23 +490,31 @@ def _align_unregistered(T_out, src, hd: HandTrack, segs, max_gap: float) -> None
     motion across the gap, but keep the segment's own shape (better than holding
     a single pose for its whole length).
     """
-    for s0, s1 in segs:
-        if src[s0] != "":
-            continue
-        known = np.flatnonzero(src != "")
-        before, after = known[known < s0], known[known >= s1]
-        cands = []
-        if len(before):
-            cands.append((hd.t[s0] - hd.t[before[-1]], before[-1], s0))
-        if len(after):
-            cands.append((hd.t[after[0]] - hd.t[s1 - 1], after[0], s1 - 1))
-        if not cands:
-            continue
-        dt, k, edge = min(cands)
-        if dt > max_gap:
-            continue
-        T_out[s0:s1] = T_out[k] @ inv(hd.T_W_S[edge]) @ hd.T_W_S[s0:s1]
-        src[s0:s1] = "slam_aligned"
+    changed = True
+    while changed:   # a newly chained segment can anchor the next one
+        changed = False
+        for s0, s1 in segs:
+            if src[s0] == "":
+                changed |= _align_one(T_out, src, hd, s0, s1, max_gap)
+
+
+def _align_one(T_out, src, hd: HandTrack, s0: int, s1: int, max_gap: float) -> bool:
+    """Chain one segment to the nearest known pose within max_gap; True if done."""
+    known = np.flatnonzero(src != "")
+    before, after = known[known < s0], known[known >= s1]
+    cands = []
+    if len(before):
+        cands.append((hd.t[s0] - hd.t[before[-1]], before[-1], s0))
+    if len(after):
+        cands.append((hd.t[after[0]] - hd.t[s1 - 1], after[0], s1 - 1))
+    if not cands:
+        return False
+    dt, k, edge = min(cands)
+    if dt > max_gap:
+        return False
+    T_out[s0:s1] = T_out[k] @ inv(hd.T_W_S[edge]) @ hd.T_W_S[s0:s1]
+    src[s0:s1] = "slam_aligned"
+    return True
 
 
 # ------------------------------------------------------------- recording wrapper

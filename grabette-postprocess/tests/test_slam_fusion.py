@@ -270,3 +270,14 @@ def test_fuse_recording_clocks_and_csv(tmp_path, monkeypatch):
     assert df.is_lost[80:110].all()                  # raw flag kept
     rep = json.loads((tmp_path / "casquette" / REPORT_JSON).read_text())
     assert rep["hands"]["right"]["sources"]["cube_direct"] == 30
+
+
+def test_hand_without_any_link_keeps_raw_slam():
+    """Other hand's cube never seen: no cross edge, so the right hand cannot be
+    put in the reference world. It must keep its raw trajectory, flagged."""
+    rng = np.random.default_rng(12)
+    L, _, _ = make_hand(rng, "L", cube_hidden=[(0, 99)])
+    R, _, _ = make_hand(rng, "R")
+    fr = fuse({"left": L, "right": R}, ref="left").hands["right"]
+    assert (fr.source == "unregistered").all()
+    assert_close(fr.T_ref_S, R.T_W_S)
