@@ -15,7 +15,11 @@
  * directly, with the exact same logic as RTABMapVIO::syncCB / initialize().
  *
  * Usage:
- *   ./offline_vslam <recording_dir> [output_poses.csv]
+ *   ./offline_vslam <recording_dir> [output_poses.csv] [--odom-reset-countdown N]
+ *
+ *   --odom-reset-countdown N  frames to stay lost before odometry resets from
+ *                             the last known pose (RTAB-Map Odom/ResetCountdown,
+ *                             default 1; 0 never resets).
  *
  * Build (standalone, no cmake needed):
  *   See build_offline_vslam.sh
@@ -39,6 +43,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -59,13 +64,40 @@ static std::string frameName(int idx) {
 }
 
 int main(int argc, char** argv) {
-    if(argc < 2) {
-        std::cerr << "Usage: offline_vslam <recording_dir> [output_poses.csv]\n";
+    const char* usage =
+        "Usage: offline_vslam <recording_dir> [output_poses.csv] "
+        "[--odom-reset-countdown N]\n";
+    // Once lost, F2M odometry does not re-register on its own: it waits for
+    // this many frames, then resets from the last known pose. The old value,
+    // 30, turned every brief failure (e.g. one blurred frame during a fast
+    // wrist turn) into a full second of frozen pose; 1 resets on the next frame.
+    int odomResetCountdown = 1;
+    std::vector<std::string> positional;
+    for(int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if(arg == "--odom-reset-countdown") {
+            if(i + 1 >= argc) { std::cerr << usage; return 1; }
+            try {
+                odomResetCountdown = std::stoi(argv[++i]);
+            } catch(const std::exception&) {
+                std::cerr << "Invalid --odom-reset-countdown: " << argv[i] << "\n";
+                return 1;
+            }
+            if(odomResetCountdown < 0) {
+                std::cerr << "--odom-reset-countdown must be >= 0\n";
+                return 1;
+            }
+        } else {
+            positional.push_back(arg);
+        }
+    }
+    if(positional.empty() || positional.size() > 2) {
+        std::cerr << usage;
         return 1;
     }
 
-    const std::string dir        = std::string(argv[1]);
-    const std::string posesPath  = (argc > 2) ? argv[2] : dir + "/poses.csv";
+    const std::string dir        = positional[0];
+    const std::string posesPath  = (positional.size() > 1) ? positional[1] : dir + "/poses.csv";
     const auto path = [&](const std::string& rel) { return dir + "/" + rel; };
 
     ULogger::setType(ULogger::kTypeConsole);
@@ -206,7 +238,8 @@ int main(int argc, char** argv) {
     // 4. Odometry
     // -----------------------------------------------------------------------
     rtabmap::ParametersMap params;
-    params[rtabmap::Parameters::kOdomResetCountdown()] = "30";
+    params[rtabmap::Parameters::kOdomResetCountdown()] = std::to_string(odomResetCountdown);
+    std::cout << "Odom/ResetCountdown: " << odomResetCountdown << "\n";
     auto odom = rtabmap::Odometry::create(params);
 
     // -----------------------------------------------------------------------

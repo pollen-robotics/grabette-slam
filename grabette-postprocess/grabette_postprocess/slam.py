@@ -190,20 +190,24 @@ def _integrate_deltas(delta_df: pd.DataFrame) -> pd.DataFrame:
     })
 
 
-def _slam_command(slam_dir: Path, *, docker_image: str, binary: str | None) -> list[str]:
+def _slam_command(slam_dir: Path, *, docker_image: str, binary: str | None,
+                  odom_reset_countdown: int | None = None) -> list[str]:
     """Build the offline_vslam invocation.
 
     With `binary`, call it directly on the host (e.g. inside a Space image that
     bundles it). Otherwise run it in Docker, mounting slam_dir at /data.
+    `odom_reset_countdown` None leaves the binary's own default.
     """
     poses_path = slam_dir / "poses.csv"
+    extra = ([] if odom_reset_countdown is None
+             else ["--odom-reset-countdown", str(int(odom_reset_countdown))])
     if binary:
-        return [binary, str(slam_dir), str(poses_path)]
+        return [binary, str(slam_dir), str(poses_path), *extra]
     return [
         "docker", "run", "--rm",
         "--volume", f"{slam_dir}:/data",
         docker_image,
-        "/data", "/data/poses.csv",
+        "/data", "/data/poses.csv", *extra,
     ]
 
 
@@ -214,6 +218,7 @@ def run_slam(
     binary: str | None = None,
     output_csv: str = "camera_trajectory.csv",
     show_progress: bool = True,
+    odom_reset_countdown: int | None = None,
 ) -> SlamResult:
     """Run offline_vslam on the slam_input/ subdir of an episode directory.
 
@@ -231,6 +236,10 @@ def run_slam(
             instead of via Docker (Docker-in-Docker is unavailable in Spaces)
         output_csv: trajectory output filename (inside episode_dir)
         show_progress: print SLAM stdout in real time
+        odom_reset_countdown: frames odometry stays lost before it resets from
+            the last known pose (RTAB-Map Odom/ResetCountdown; 0 never resets).
+            None uses the binary's default (1). Needs an offline_vslam built
+            from this repo: older images ignore the option and keep 30.
 
     Returns:
         SlamResult with tracking statistics
@@ -242,7 +251,10 @@ def run_slam(
         raise FileNotFoundError(f"No slam_input/ subdir in {episode_dir}")
 
     poses_path = slam_dir / "poses.csv"
-    cmd = _slam_command(slam_dir, docker_image=docker_image, binary=binary)
+    if odom_reset_countdown is not None and odom_reset_countdown < 0:
+        raise ValueError(f"odom_reset_countdown must be >= 0, got {odom_reset_countdown}")
+    cmd = _slam_command(slam_dir, docker_image=docker_image, binary=binary,
+                        odom_reset_countdown=odom_reset_countdown)
 
     if show_progress:
         print(f"Running SLAM on {episode_dir.name}...")
