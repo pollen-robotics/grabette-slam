@@ -422,7 +422,9 @@ def fuse(hands: dict[str, HandTrack], ref: str | None = None, *,
             elif okh[i]:
                 est[i], est_kind[i] = H[i] @ T_C_S[i], "cube_head"
 
-        fill = (src == "") & (est_kind != "")
+        # only frames the SLAM really lost: tracked frames of an unregistered
+        # segment keep their own shape (chained below), never a lone cube pose
+        fill = (src == "") & hd.lost & (est_kind != "")
         T_out[fill], src[fill] = est[fill], est_kind[fill]
         seams += _correct_seams(h, T_out, src, est, est_kind)
 

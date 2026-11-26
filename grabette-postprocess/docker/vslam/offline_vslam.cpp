@@ -35,6 +35,7 @@
 
 #include <Eigen/Geometry>
 
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -206,7 +207,25 @@ int main(int argc, char** argv) {
     // 4. Odometry
     // -----------------------------------------------------------------------
     rtabmap::ParametersMap params;
-    params[rtabmap::Parameters::kOdomResetCountdown()] = "30";
+    // Odom/ResetCountdown: consecutive lost frames before odometry resets to
+    // its last pose with a fresh local map. rtabmap's default (0) never
+    // resets, so a lost odometry would stay lost. While waiting, odometry may
+    // re-attach to its old local map without a break, but nothing tracks the
+    // motion; on reset that unseen motion is lost and the next segment starts
+    // offset. 30 (1 s) came from the Luxonis rtabmap_vio.cpp example (OAK
+    // camera, IMU guess, brief losses). The Gemini 305 has no IMU, and
+    // re-attachment never happened in our data, so waiting only lost motion:
+    // ~7deg/21mm per gap with 1 vs 54-82deg/140-152mm with 10-30. On the 50
+    // open-grey-bottle episodes, 1 cut right-hand lost frames 1511 -> 244 and
+    // raw SLAM p90 hand-to-hand error 43deg/105mm -> 12deg/42mm (gaps are then
+    // short and filled by the ArUco cube fusion). Revisit (rerun the 1 vs 30
+    // test) for a camera with an IMU. Override with ODOM_RESET_COUNTDOWN.
+    {
+        const char* rc = std::getenv("ODOM_RESET_COUNTDOWN");
+        const std::string countdown = (rc && *rc) ? rc : "1";
+        params[rtabmap::Parameters::kOdomResetCountdown()] = countdown;
+        std::cout << "Odom/ResetCountdown = " << countdown << "\n";
+    }
     auto odom = rtabmap::Odometry::create(params);
 
     // -----------------------------------------------------------------------

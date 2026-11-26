@@ -281,3 +281,15 @@ def test_hand_without_any_link_keeps_raw_slam():
     fr = fuse({"left": L, "right": R}, ref="left").hands["right"]
     assert (fr.source == "unregistered").all()
     assert_close(fr.T_ref_S, R.T_W_S)
+
+
+def test_unregistered_segment_not_anchored_on_lone_cube_frames():
+    """Left cube seen on only a couple of instants: too few for a cross edge.
+    Those instants must not become lone `cube_direct` anchors for tracked
+    frames; the right hand stays unregistered (raw SLAM)."""
+    rng = np.random.default_rng(13)
+    L, _, _ = make_hand(rng, "L", cube_hidden=[(0, 3.0), (3.06, 99)])
+    R, _, _ = make_hand(rng, "R")
+    res = fuse({"left": L, "right": R}, ref="left")
+    assert res.registration[("right", 0)]["via"] == "unregistered"
+    assert (res.hands["right"].source == "unregistered").all()
