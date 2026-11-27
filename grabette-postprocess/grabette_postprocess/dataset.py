@@ -17,6 +17,7 @@ only when every episode has them (see _optional_stream_policy).
 """
 
 import json
+import time
 from pathlib import Path
 
 from grabette_postprocess.episode_files import depth_camera_model, resolve
@@ -125,6 +126,35 @@ def _depth_feature(size: tuple[int, int]) -> dict:
 def _depth_encoder():
     from lerobot.configs import DepthEncoderConfig
     return DepthEncoderConfig(**DEPTH_QUANTIZATION)
+
+
+# HOTFIX — remove when bumping to lerobot 0.7.1.
+# LeRobot's streaming encoder DROPS a frame when a camera's queue is still full
+# after 0.1 s (StreamingVideoEncoder.feed_frame), which suits live capture but
+# not this offline build: frames arrive faster than h264/x265 encode them, so
+# videos came out shorter than the parquet (up to 170 frames lost per camera on
+# a 100-episode dataset) and images drifted out of sync with actions.
+# huggingface/lerobot#4462 adds `encoder_drop_on_full=False` to
+# LeRobotDataset.create(), which waits for room instead. Once we are on
+# lerobot 0.7.1, pass that flag to both create() calls and delete this helper
+# and its two call sites.
+def _wait_for_encoder_room(dataset, timeout_s: float = 120.0, poll_s: float = 0.002) -> None:
+    """Block until every camera queue of the streaming encoder can take one
+    more frame, so LeRobot never reaches its drop-on-full path.
+
+    Reads LeRobot internals (dataset.writer._streaming_encoder._frame_queues,
+    lerobot 0.6.x); if they are absent — non-streaming mode or other internals —
+    it does nothing. Raises if the queues stay full for `timeout_s` (e.g. a dead
+    encoder thread) rather than hanging the build.
+    """
+    enc = getattr(getattr(dataset, "writer", None), "_streaming_encoder", None)
+    queues = getattr(enc, "_frame_queues", None) or {}
+    deadline = time.monotonic() + timeout_s
+    while any(q.maxsize > 0 and q.qsize() >= q.maxsize for q in queues.values()):
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"Streaming video encoder made no progress for {timeout_s:.0f} s")
+        time.sleep(poll_s)
 
 
 def _load_video_frames_indexed(video_path: Path, size: tuple[int, int],
@@ -570,6 +600,7 @@ def build_dataset(
                 frame["observation.images.dcam_depth"] = depth  # uint16 mm
             if with_imu:
                 frame["imu"] = imu_rows[i]
+            _wait_for_encoder_room(dataset)  # HOTFIX, see helper
             dataset.add_frame(frame)
             wrote += 1
 
@@ -890,6 +921,7 @@ def build_dataset_multi(
             frame["is_lost"] = np.array(lost_parts, dtype=np.float32)
             if with_imu:
                 frame["imu"] = np.concatenate(imu_parts).astype(np.float32)
+            _wait_for_encoder_room(dataset)  # HOTFIX, see helper
             dataset.add_frame(frame)
             wrote += 1
 
