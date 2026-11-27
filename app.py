@@ -234,6 +234,11 @@ class _ProcessReq(BaseModel):
     # explicitly (see GRABETTE_KEEP_RAW_DATASET there); pass False to restore the
     # delete-on-success behaviour.
     keep_raw: bool = True
+    # Recordings converted and pushed per batch (None = the Space default,
+    # GRABETTE_BATCH_SIZE, 10; 0 = everything in one push). A run cut short leaves
+    # the pushed batches on the Hub, and re-running the same source → target
+    # continues from there.
+    batch_size: int | None = None
     # SLAM check: run the precheck + SLAM to REPORT quality, and build/push the
     # dataset only if at least one episode is flagged (verdict != GOOD) — a clean
     # check leaves nothing on the Hub. Sent by the fleet and forwarded by the device
@@ -254,7 +259,8 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                             roles: list[str] | None = None,
                             keep_raw: bool = True,
                             check_only: bool = False,
-                            keep: list[str] | None = None) -> None:
+                            keep: list[str] | None = None,
+                            batch_size: int | None = None) -> None:
     """Run the pipeline synchronously in a background thread.
 
     exclude_fail: drop episodes with trajectory verdict FAIL.
@@ -265,6 +271,9 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                   auto-deletes a raw for now).
     check_only:   SLAM check — report quality, and push the dataset only if an
                   episode is flagged (see the push decision below).
+    batch_size:   recordings built + pushed per batch (None = BATCH_SIZE). If the
+                  target holds an interrupted run of this source, its recordings
+                  are skipped and the new ones appended (see resume_point).
     All episodes appear in the returned quality data (including excluded ones)
     so the caller can display a full recap.
     """
@@ -309,19 +318,30 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
         ds_root = work / "lerobot"
 
         with contextlib.redirect_stdout(type("W", (), {"write": lambda s, m: log(m.rstrip()) or None, "flush": lambda s: None})()): # noqa: E501
-            from pipeline import (build_recordings, episode_label,
-                                  find_episode_dirs, precheck_episodes, run_slam,
-                                  push_lerobot)
+            from pipeline import (BATCH_SIZE, build_recordings, episode_label,
+                                  find_episode_dirs, precheck_episodes, recording_id,
+                                  resume_point, run_slam, push_lerobot)
 
             episodes = find_episode_dirs(Path(raw))
             if not episodes:
                 raise ValueError(f"No episodes found under {raw}")
             log(f"Found {len(episodes)} episode(s).")
+            # An interrupted run of this source → target: skip what it pushed.
+            done = resume_point(target_repo, "main",
+                                {recording_id(ep) for ep in episodes},
+                                token=token, log=log)
+            if done:
+                episodes = [ep for ep in episodes if recording_id(ep) not in done]
+                log(f"Continuing {target_repo}: {len(done)} recording(s) already in "
+                    f"it, {len(episodes)} episode(s) left.")
 
             # Pre-check: record quality data for all episodes; exclude those with
             # recording errors unconditionally, and optionally exclude those with
             # recording warnings or poor sync depending on caller flags.
-            checks = precheck_episodes(episodes, log=log, run_sync=run_sync)
+            checks = precheck_episodes(episodes, log=log, run_sync=run_sync) if episodes else []
+            if done and not episodes:
+                log("✅ Every recording is already in the target — nothing to do.")
+                result_link = f"https://huggingface.co/datasets/{target_repo}"
             for c in checks:
                 sync = c.get("sync") or {}
                 sync_verdict = sync.get("verdict", "GOOD")
@@ -342,7 +362,9 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                         "excluded": False,
                     })
             slam_input = [c["ep"] for c in checks if not c["errors"]]
-            if not slam_input:
+            if not episodes:
+                pass  # resumed run with nothing left (logged above)
+            elif not slam_input:
                 log("⚠ All episodes failed the recording check — nothing to process.")
             else:
                 # SLAM: convert + trajectory per episode.
@@ -409,15 +431,20 @@ def _run_pipeline_headless(job_id: str, source_repo: str, target_repo: str,
                     # inferred from the layout, so a legacy flat upload keeps the
                     # original single-arm schema.
                     report_by_ep = {ep: rep for ep, rep in slam_results}
-                    built = build_recordings(target_repo, task, ds_root, kept,
-                                             report_by_ep, roles=roles, log=log,
-                                             keep=keep)
-                    n_built = len(built)
-                    n, link, _mode = push_lerobot(target_repo, task, ds_root,
-                                                  n_built, token=token, log=log,
-                                                  private=private)
-                    result_link = link or f"https://huggingface.co/datasets/{target_repo}"
-                    log(f"✅ Done — {n} episode(s).")
+
+                    def push_batch(broot, recs, k, n_batches, final):
+                        push_lerobot(target_repo, task, broot, len(recs),
+                                     token=token, log=log, private=private)
+                        if n_batches > 1:
+                            log(f"  ✓ batch {k + 1}/{n_batches} pushed")
+
+                    built = build_recordings(
+                        target_repo, task, ds_root, kept, report_by_ep, roles=roles,
+                        log=log, keep=keep, token=token, on_batch=push_batch,
+                        batch_size=BATCH_SIZE if batch_size is None else batch_size,
+                        append=done is not None, revision="main")
+                    result_link = f"https://huggingface.co/datasets/{target_repo}"
+                    log(f"✅ Done — {len(built)} episode(s).")
 
         _rest_jobs[job_id].update(
             status="done",
@@ -482,7 +509,7 @@ async def api_process(req: _ProcessReq, authorization: str | None = Header(defau
         kwargs={"exclude_fail": req.exclude_fail, "exclude_bad": req.exclude_bad,
                 "private": req.private, "run_sync": req.run_sync, "roles": req.roles,
                 "keep_raw": req.keep_raw, "check_only": check_only,
-                "keep": req.keep},
+                "keep": req.keep, "batch_size": req.batch_size},
         daemon=True,
     )
     t.start()

@@ -22,7 +22,16 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 
 import session
-from pipeline import CONTENT_OPTIONS, build_lerobot, episode_label, push_lerobot
+from pipeline import (
+    BATCH_SIZE,
+    CONTENT_OPTIONS,
+    _branch_name,
+    build_lerobot,
+    episode_label,
+    push_lerobot,
+    resume_point,
+    source_recording_ids,
+)
 from views import (
     bar,
     btns,
@@ -272,7 +281,21 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
     logs.append("  ✓ source readable")
     logs.append(f"  ✓ write access to '{target_repo.split('/')[0]}'")
 
-    if not exists:
+    # A target left behind by an interrupted run of this same source continues
+    # where it stopped: its recordings are skipped and new batches are appended.
+    revision = _branch_name(task) if to_branch else "main"
+    done = None
+    if exists:
+        try:
+            done = resume_point(target_repo, revision,
+                                source_recording_ids(api, source_repo),
+                                token=token, log=logs.append)
+        except Exception as e:  # never block a run on this check
+            logs.append(f"  ⚠️ couldn't check whether {target_repo} can be continued: {e}")
+    if done is not None:
+        logs.append(f"Target '{target_repo}' ({revision}) already holds {len(done)} "
+                    f"recording(s) of this source — continuing it")
+    elif not exists:
         logs.append(f"Target '{target_repo}' is new and writable")
     elif not to_branch:
         logs.append(f"Target '{target_repo}' already exists")
@@ -436,21 +459,40 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
                 print("Download complete.\n\n")
                 q.put(("progress", 0.30, "converting"))
                 ds_root = work / "lerobot"
+                pushed = {"n": 0}
+
+                def push_batch(broot, recs, k, n_batches, final):
+                    """Push the dataset built so far; the build then continues."""
+                    result["built"] = {"root": str(broot),
+                                       "n": pushed["n"] + len(recs), "last": final}
+                    _n, link, mode = push_lerobot(
+                        target_repo, task, broot, pushed["n"] + len(recs),
+                        to_branch=to_branch, token=token, log=print,
+                        on_progress=on_progress, gate=sess.wait_if_paused)
+                    pushed["n"] += len(recs)
+                    result["pushed_n"] = pushed["n"]
+                    pushed["link"], pushed["mode"] = link, mode
+                    result.pop("built")
+                    if n_batches > 1:
+                        print(f"  ✓ batch {k + 1}/{n_batches} pushed "
+                              f"({pushed['n']} recording(s) so far)")
+
                 # One entry per LeRobot episode written — in a bimanual raw
                 # dataset that's one per recording (both arms), not one per arm.
+                # Each batch is pushed as soon as it's built (push_batch).
                 built = build_lerobot(
                     raw, target_repo, task, root=ds_root,
                     log=print, should_stop=sess.stop.is_set, to_branch=to_branch,
                     on_progress=on_progress, token=token, gate=sess.wait_if_paused,
                     pre_review=pre_review_cb, review=review_cb, run_sync=run_sync,
-                    keep=list(keep or []), content_review=content_review_cb)
-                # Build done — dataset cached on disk; record it so that if the push
-                # fails, the "Retry push" button can reuse it (no re-running SLAM).
-                result["built"] = {"root": str(ds_root), "n": len(built)}
-                n, link, mode = push_lerobot(
-                    target_repo, task, ds_root, len(built),
-                    to_branch=to_branch, token=token, log=print,
-                    on_progress=on_progress, gate=sess.wait_if_paused)
+                    keep=list(keep or []), content_review=content_review_cb,
+                    skip_recordings=done or (), batch_size=BATCH_SIZE,
+                    on_batch=push_batch, append=done is not None, revision=revision)
+                n = len(built)
+                link = pushed.get("link")
+                mode = pushed.get("mode", "branch" if to_branch else "main")
+                if to_branch and link is None:
+                    link = f"https://huggingface.co/datasets/{target_repo}/tree/{revision}"
                 writer.flush()
             result["n"], result["link"], result["mode"] = n, link, mode
         except Exception as e:
@@ -481,7 +523,17 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
     t.join()
     if "error" in result:
         err = result["error"]
-        if result.get("built"):
+        resume_hint = (
+            f"\n\n{result['pushed_n']} recording(s) were already pushed to "
+            f"{target_repo}. Run the same source → target again to continue: those "
+            f"recordings are skipped." if result.get("pushed_n") else "")
+        if result.get("built") and not result["built"].get("last", True):
+            # A middle batch failed to push: later batches were never built, so a
+            # push-only retry would leave them out. Re-running continues instead.
+            label = "push failed"
+            yield view(summary=error_card(f"Push failed: {err}{resume_hint}")
+                       + content_recap(logs) + run_recap(logs), state="finished")
+        elif result.get("built"):
             # Build succeeded, push didn't — offer a push-only retry, no re-SLAM.
             retry_ctx = {"target_repo": target_repo, "task": task, "to_branch": to_branch,
                          "root": result["built"]["root"], "n": result["built"]["n"]}
@@ -493,8 +545,8 @@ def _run(source_repo, target_repo, task, run_sync, keep, oauth_token, to_branch,
                        state="finished", retry=True)
         else:
             label = "failed"
-            yield view(summary=error_card(f"Pipeline failed: {err}") + run_recap(logs),
-                       state="finished")
+            yield view(summary=error_card(f"Pipeline failed: {err}{resume_hint}")
+                       + run_recap(logs), state="finished")
         return
 
     n = result["n"]

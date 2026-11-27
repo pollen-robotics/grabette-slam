@@ -302,3 +302,176 @@ def test_depth_camera_model_fallbacks(tmp_path):
     assert depth_camera_model(ep) == "oakd"
     _set_camera(ep, "gemini305")  # metadata wins
     assert depth_camera_model(ep) == "gemini305"
+
+
+# --- appending (batched build + push) ------------------------------------------
+def _hub_after_push(first_root, batch_root, merged):
+    """What the Hub holds after pushing `first_root`, then `batch_root` on top of
+    it: upload_folder adds and overwrites files, it never deletes any."""
+    import shutil
+    shutil.copytree(first_root, merged)
+    shutil.copytree(batch_root, merged, dirs_exist_ok=True)
+    return merged
+
+
+def _resume_locally(first_root, batch_root):
+    """resume() downloads only meta/ from the Hub; offline, seed it by hand."""
+    import shutil
+    shutil.copytree(first_root / "meta", batch_root / "meta")
+
+
+def test_build_dataset_append_batch(tmp_path):
+    from lerobot.datasets import LeRobotDataset
+
+    eps = [_make_episode(tmp_path / f"rec{i}") for i in range(3)]
+    repo_id = "test/grabette_batches"
+    first, batch = tmp_path / "batch1", tmp_path / "batch2"
+
+    saved = build_dataset(repo_id, eps[:2], task="pick", fps=30, root=first,
+                          with_depth=False, source_user="alice",
+                          tags_by_recording={"rec0": ["fixed_gripper"]})
+    assert saved == ["rec0", "rec1"]
+
+    _resume_locally(first, batch)
+    saved = build_dataset(repo_id, eps[2:], task="pick", fps=30, root=batch,
+                          with_depth=False, source_user="alice",
+                          tags_by_recording={"rec2": ["tracking_lost"]}, append=True)
+    assert saved == ["rec2"]
+    # the batch folder only gets new data/video files: nothing earlier is rewritten
+    assert not any((batch / "videos").rglob("file-000.mp4"))
+
+    ds = LeRobotDataset(repo_id, root=_hub_after_push(first, batch, tmp_path / "hub"))
+    assert ds.meta.total_episodes == 3
+    assert ds.meta.total_frames == 3 * N
+    assert [ds.meta.episodes[i]["recording"] for i in range(3)] == ["rec0", "rec1", "rec2"]
+    # earlier episodes keep their columns, the new one gets its own
+    assert [list(ds.meta.episodes[i]["tags"]) for i in range(3)] == [
+        ["fixed_gripper"], [], ["tracking_lost"]]
+    assert [ds.meta.episodes[i]["depth_camera"] for i in range(3)] == ["unknown"] * 3
+    # every frame decodes, including the appended episode's
+    for i in range(len(ds)):
+        item = ds[i]
+        assert int(item["episode_index"]) == i // N
+        assert item["observation.images.cam0"].shape[0] == 3
+    sources = json.loads((tmp_path / "hub/meta/episode_sources.json").read_text())
+    assert [(e["episode_index"], e["recording"]) for e in sources["episodes"]] == [
+        (0, "rec0"), (1, "rec1"), (2, "rec2")]
+
+
+def test_build_dataset_append_rejects_other_schema(tmp_path):
+    eps = [_make_episode(tmp_path / f"rec{i}") for i in range(2)]
+    first, batch = tmp_path / "batch1", tmp_path / "batch2"
+    build_dataset("test/grabette_schema", eps[:1], task="pick", fps=30, root=first,
+                  with_depth=False)
+    _resume_locally(first, batch)
+    with pytest.raises(RuntimeError, match="don't match"):
+        build_dataset("test/grabette_schema", eps[1:], task="pick", fps=30, root=batch,
+                      with_depth=False, with_imu=True, append=True)
+
+
+# --- checkpoints (push while building, same files) ----------------------------------
+def _dataset_files(root):
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*")
+                  if p.suffix in (".parquet", ".mp4"))
+
+
+def _snapshotting(root, snaps_dir, calls):
+    """on_checkpoint that copies what a push would upload at that moment."""
+    import shutil
+
+    def on_checkpoint(new, final):
+        snap = snaps_dir / f"push{len(calls)}"
+        shutil.copytree(root, snap)
+        calls.append((list(new), final, snap))
+    return on_checkpoint
+
+
+def test_build_dataset_checkpoints_keep_the_same_files(tmp_path):
+    from lerobot.datasets import LeRobotDataset
+
+    eps = [_add_depth(_make_episode(tmp_path / f"rec{i}")) for i in range(5)]
+    kw = dict(task="pick", fps=30, depth_size=(DEPTH_H, DEPTH_W), source_user="alice",
+              tags_by_recording={"rec0": ["fixed_gripper"], "rec3": ["tracking_lost"]})
+    root, calls = tmp_path / "ds", []
+    saved = build_dataset("test/ckpt", eps, root=root, checkpoint_every=2,
+                          on_checkpoint=_snapshotting(root, tmp_path, calls), **kw)
+    assert saved == [f"rec{i}" for i in range(5)]
+    assert [(new, final) for new, final, _ in calls] == [
+        (["rec0", "rec1"], False), (["rec2", "rec3"], False), (["rec4"], True)]
+
+    # every pushed state is a complete dataset holding the episodes so far
+    for (_, _, snap), n_eps in zip(calls, (2, 4, 5)):
+        ds = LeRobotDataset("test/ckpt", root=snap)
+        assert ds.meta.total_episodes == n_eps and len(ds) == n_eps * N
+        assert [ds.meta.episodes[i]["recording"] for i in range(n_eps)] == saved[:n_eps]
+        for i in range(len(ds)):
+            assert int(ds[i]["episode_index"]) == i // N  # every frame decodes
+        _assert_depth_roundtrip(ds, "observation.images.dcam_depth")
+        sources = json.loads((snap / "meta/episode_sources.json").read_text())
+        assert [e["recording"] for e in sources["episodes"]] == saved[:n_eps]
+    ds = LeRobotDataset("test/ckpt", root=root)
+    assert [list(ds.meta.episodes[i]["tags"]) for i in range(5)] == [
+        ["fixed_gripper"], [], [], ["tracking_lost"], []]
+
+    # same files and tables as a build in one go: the checkpoints split nothing
+    ref = tmp_path / "ref"
+    build_dataset("test/ckpt", eps, root=ref, **kw)
+    assert _dataset_files(root) == _dataset_files(ref)
+    for f in _dataset_files(ref):
+        if f.endswith(".parquet"):
+            pd.testing.assert_frame_equal(pd.read_parquet(root / f),
+                                          pd.read_parquet(ref / f))
+
+
+def test_build_dataset_multi_checkpoints(tmp_path):
+    from lerobot.datasets import LeRobotDataset
+
+    from grabette_postprocess.dataset import build_dataset_multi
+
+    groups = {f"rec{i}": {r: _make_episode(tmp_path / f"rec{i}" / r)
+                          for r in ("left", "right")} for i in range(3)}
+    root, calls = tmp_path / "ds", []
+    saved = build_dataset_multi(
+        "test/ckpt_multi", groups, ["left", "right"], task="pick", fps=30, root=root,
+        with_depth=False, checkpoint_every=1,
+        on_checkpoint=_snapshotting(root, tmp_path, calls))
+    assert saved == ["rec0", "rec1", "rec2"]
+    assert [(new, final) for new, final, _ in calls] == [
+        (["rec0"], False), (["rec1"], False), (["rec2"], True)]
+    for k, (_, _, snap) in enumerate(calls):
+        ds = LeRobotDataset("test/ckpt_multi", root=snap)
+        assert ds.meta.total_episodes == k + 1
+        assert [ds.meta.episodes[i]["left_depth_camera"] for i in range(k + 1)] == \
+            ["unknown"] * (k + 1)
+        for i in range(len(ds)):
+            ds[i]
+    assert all(p.name == "file-000.mp4" for p in (root / "videos").rglob("*.mp4"))
+
+
+def test_build_dataset_append_then_checkpoints(tmp_path):
+    """A resumed run (after a crash) starts new files once, then checkpoints in them."""
+    from lerobot.datasets import LeRobotDataset
+
+    eps = [_make_episode(tmp_path / f"rec{i}") for i in range(3)]
+    first, batch, calls = tmp_path / "first", tmp_path / "batch", []
+    build_dataset("test/ckpt_append", eps[:1], task="pick", fps=30, root=first,
+                  with_depth=False, tags_by_recording={"rec0": ["fixed_gripper"]})
+    _resume_locally(first, batch)
+    build_dataset("test/ckpt_append", eps[1:], task="pick", fps=30, root=batch,
+                  with_depth=False, tags_by_recording={"rec2": ["tracking_lost"]},
+                  append=True, checkpoint_every=1,
+                  on_checkpoint=_snapshotting(batch, tmp_path / "snaps", calls))
+    assert [(new, final) for new, final, _ in calls] == [
+        (["rec1"], False), (["rec2"], True)]
+    for k, (_, _, snap) in enumerate(calls):
+        hub = _hub_after_push(first, snap, tmp_path / f"hub{k}")
+        ds = LeRobotDataset("test/ckpt_append", root=hub)
+        assert ds.meta.total_episodes == k + 2
+        assert [ds.meta.episodes[i]["recording"] for i in range(k + 2)] == \
+            [f"rec{i}" for i in range(k + 2)]
+        for i in range(len(ds)):
+            ds[i]
+    assert [list(ds.meta.episodes[i]["tags"]) for i in range(3)] == [
+        ["fixed_gripper"], [], ["tracking_lost"]]
+    # the resumed run's episodes share one new file per stream
+    assert {p.name for p in (batch / "videos").rglob("*.mp4")} == {"file-001.mp4"}

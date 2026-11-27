@@ -157,6 +157,145 @@ def _wait_for_encoder_room(dataset, timeout_s: float = 120.0, poll_s: float = 0.
         time.sleep(poll_s)
 
 
+def _open_dataset(repo_id: str, root, fps: float, features: dict, with_depth: bool,
+                  append: bool, revision: str | None, token: str | None):
+    """A LeRobot dataset ready to take new episodes.
+
+    append=False: a new dataset at `root`.
+    append=True: continue `repo_id` from the Hub (revision, e.g. "main" or a
+        branch). Only its metadata is downloaded into `root`: LeRobot starts the
+        first appended episode in new data/video files, so the files already on
+        the Hub are never needed locally. The schema must match the one built
+        now, otherwise the appended episodes would not fit the dataset.
+    """
+    from lerobot.configs import RGBEncoderConfig
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    common = dict(
+        # h264 kept over the libsvtav1 default so the LeRobot web visualizer can play it
+        rgb_encoder=RGBEncoderConfig(vcodec="h264"),
+        depth_encoder=_depth_encoder() if with_depth else None,
+        # Encode frames straight to MP4 as they're added, instead of writing every
+        # frame to disk as PNG and re-reading + re-encoding at save_episode(). The
+        # PNG round-trip is the main cost of the "building dataset" step on CPU.
+        streaming_encoding=True,
+    )
+    if not append:
+        return LeRobotDataset.create(repo_id=repo_id, fps=int(fps), features=features,
+                                     root=root, robot_type="grabette", use_videos=True,
+                                     **common)
+    dataset = LeRobotDataset.resume(repo_id, root=root, revision=revision, token=token,
+                                    **common)
+    _check_same_schema(dataset.meta, int(fps), features)
+    return dataset
+
+
+def _check_same_schema(meta, fps: int, features: dict) -> None:
+    """Raise if an existing dataset can't take episodes built with `features`."""
+    have = {k: v for k, v in meta.features.items() if k in features or
+            k.startswith(("observation.", "action", "is_lost", "imu"))}
+    problems = []
+    if meta.fps != fps:
+        problems.append(f"fps {meta.fps} vs {fps}")
+    for k in sorted(set(have) | set(features)):
+        if k not in have:
+            problems.append(f"{k} is new")
+        elif k not in features:
+            problems.append(f"{k} is not built this time")
+        elif (have[k]["dtype"] != features[k]["dtype"]
+              or tuple(have[k]["shape"]) != tuple(features[k]["shape"])):
+            problems.append(f"{k} differs")
+    if problems:
+        raise RuntimeError(
+            f"Can't append to {meta.repo_id}: its features don't match this build "
+            f"({'; '.join(problems)}). Pick the same dataset content as the first run, "
+            f"or push to a new target.")
+
+
+def _checkpoint_close(dataset) -> None:
+    """Make the dataset on disk complete and readable without finalizing it.
+
+    After save_episode() every video file and info.json / stats.json are already
+    complete; only the frame table (data/) and the episode list (meta/episodes/)
+    are parquet files still open for writing, and a parquet file can't be read
+    until it is closed. Call _checkpoint_reopen before the next episode.
+    Uses LeRobot 0.6.x internals (DatasetWriter, LeRobotDatasetMetadata)."""
+    dataset.writer.close_writer()
+    dataset.meta._close_writer()  # also writes the buffered episode entries
+
+
+def _reopen_parquet(path: Path, drop=()):
+    """A ParquetWriter on `path` that already holds the file's rows (minus the
+    `drop` columns), so the next rows are added after them."""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path, memory_map=False)  # fully in memory: path is rewritten
+    table = table.drop([c for c in drop if c in table.column_names])
+    writer = pq.ParquetWriter(path, schema=table.schema, compression="snappy",
+                              use_dictionary=True)
+    writer.write_table(table)
+    return writer
+
+
+def _checkpoint_reopen(dataset, extra_columns=()) -> None:
+    """Reopen the files _checkpoint_close closed, keeping their rows, so the next
+    episodes go into the same files. Left to itself LeRobot would open a new
+    ParquetWriter on the same path, which starts an empty file and loses every
+    row written before the checkpoint.
+
+    extra_columns: our columns added to the episode list at the checkpoint (see
+    _write_episode_columns). They are dropped here because LeRobot's next rows
+    don't have them, and written again at the next checkpoint."""
+    from lerobot.datasets.utils import DEFAULT_EPISODES_PATH
+
+    writer, meta, root = dataset.writer, dataset.meta, Path(dataset.root)
+    ep = writer._latest_episode
+    if writer._pq_writer is None and ep is not None:
+        writer._pq_writer = _reopen_parquet(root / meta.data_path.format(
+            chunk_index=ep["data/chunk_index"], file_index=ep["data/file_index"]))
+    ep = meta.latest_episode
+    if meta._pq_writer is None and ep is not None:
+        meta._pq_writer = _reopen_parquet(root / DEFAULT_EPISODES_PATH.format(
+            chunk_index=ep["meta/episodes/chunk_index"][0],
+            file_index=ep["meta/episodes/file_index"][0]), drop=extra_columns)
+
+
+class _Checkpoints:
+    """Hand the dataset to on_checkpoint every `every` recordings while it is being
+    built, then keep writing to the same files (no new data/video files).
+
+    on_checkpoint(new_recordings, final) gets the recordings saved since the last
+    call; the dataset under `root` is then complete and can be pushed. It is
+    called once more with final=True after the build, if anything is left.
+    write_extras() writes our metadata (episode_sources.json, extra episode
+    columns) for everything saved so far and returns the extra column names."""
+
+    def __init__(self, dataset, every: int, on_checkpoint, write_extras):
+        self.dataset, self.on_checkpoint, self.write_extras = (
+            dataset, on_checkpoint, write_extras)
+        self.every = every if on_checkpoint else 0
+        self.pending: list[str] = []
+
+    def before(self, n_done: int) -> None:
+        """Call before each recording, with the number already processed."""
+        if not (self.every and n_done and n_done % self.every == 0 and self.pending):
+            return
+        _checkpoint_close(self.dataset)
+        extra = self.write_extras()
+        new, self.pending = self.pending, []
+        self.on_checkpoint(new, False)
+        _checkpoint_reopen(self.dataset, extra)
+
+    def saved(self, recording: str) -> None:
+        self.pending.append(recording)
+
+    def finish(self) -> None:
+        """Call after dataset.finalize() and write_extras()."""
+        if self.on_checkpoint and self.pending:
+            new, self.pending = self.pending, []
+            self.on_checkpoint(new, True)
+
+
 def _load_video_frames_indexed(video_path: Path, size: tuple[int, int],
                                needed_indices: set[int]) -> dict[int, np.ndarray]:
     """Load only the video frames at the given indices.
@@ -425,6 +564,11 @@ def build_dataset(
     depth_size: tuple[int, int] = DEPTH_SIZE,
     with_right: bool | None = None,
     with_imu: bool | None = None,
+    append: bool = False,
+    revision: str | None = None,
+    token: str | None = None,
+    checkpoint_every: int = 0,
+    on_checkpoint=None,
 ):
     """Build LeRobot v3 dataset from processed episode directories.
 
@@ -463,14 +607,21 @@ def build_dataset(
             like dcam). None = only when every episode has it; True = always,
             skipping episodes without it; False = never.
         with_imu: add `imu` (see IMU_NAMES), same None/True/False rule.
+        append: add the episodes to the existing `repo_id` on the Hub instead of
+            creating a dataset (see _open_dataset). `root` then only holds its
+            metadata plus the new episodes; push it to add them.
+        revision: Hub revision to append to (with append), e.g. "main".
+        token: HF token used to read the existing metadata (with append).
+        checkpoint_every / on_checkpoint: every `checkpoint_every` recordings,
+            make the dataset under `root` complete and call
+            on_checkpoint(new_recordings, final=False) (e.g. to push it), then keep
+            writing to the same files. on_checkpoint is called a last time with
+            final=True after the build for the rest. See _Checkpoints.
 
-    Every saved episode also gets a `depth_camera` column in the episodes
-    metadata ("oakd", "gemini305", … or "unknown", see depth_camera_model).
+    Every saved episode also gets a `recording` column (its source recording) and
+    a `depth_camera` column in the episodes metadata ("oakd", "gemini305", … or
+    "unknown", see depth_camera_model).
     """
-    # Lazy import — lerobot is a heavy dependency
-    from lerobot.configs import RGBEncoderConfig
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
     name_of = recording_name_of or (lambda d: Path(d).name)
     episode_dirs = [Path(d).absolute() for d in episode_dirs]
 
@@ -497,28 +648,30 @@ def build_dataset(
         features["imu"] = {"dtype": "float32", "shape": (len(IMU_NAMES),),
                            "names": list(IMU_NAMES)}
 
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=int(fps),
-        features=features,
-        root=root,
-        robot_type="grabette",
-        use_videos=True,
-        # h264 kept over the libsvtav1 default so the LeRobot web visualizer can play it
-        rgb_encoder=RGBEncoderConfig(vcodec="h264"),
-        depth_encoder=_depth_encoder() if with_depth else None,
-        # Encode frames straight to MP4 as they're added, instead of writing every
-        # frame to disk as PNG and re-reading + re-encoding at save_episode(). The
-        # PNG round-trip is the main cost of the "building dataset" step on CPU.
-        streaming_encoding=True,
-    )
+    dataset = _open_dataset(repo_id, root, fps, features, with_depth,
+                            append, revision, token)
+    first_index = dataset.meta.total_episodes
 
-    # Source recording name per saved episode, aligned with episode_index (0..N-1
-    # in save order). Episodes skipped below (no trajectory CSV) are not appended.
+    # Source recording name per saved episode, aligned with episode_index
+    # (first_index.. in save order). Episodes skipped below are not appended.
     saved_recordings: list[str] = []
     camera_by_recording: dict[str, str] = {}
 
-    for ep_dir in episode_dirs:
+    def write_extras() -> list[str]:
+        if source_user:
+            _write_episode_sources(Path(dataset.root), saved_recordings, source_user,
+                                   first_index)
+        columns = {"recording": {r: r for r in saved_recordings},
+                   "depth_camera": camera_by_recording}
+        if tags_by_recording is not None:
+            columns["tags"] = tags_by_recording
+        _write_episode_columns(Path(dataset.root), saved_recordings, columns,
+                               first_index)
+        return list(columns)
+
+    checkpoints = _Checkpoints(dataset, checkpoint_every, on_checkpoint, write_extras)
+    for n_done, ep_dir in enumerate(episode_dirs):
+        checkpoints.before(n_done)
         print(f"\nProcessing {ep_dir.name}...")
 
         # Find trajectory file
@@ -611,20 +764,17 @@ def build_dataset(
         rec = name_of(ep_dir)
         saved_recordings.append(rec)
         camera_by_recording[rec] = depth_camera_model(ep_dir)
+        checkpoints.saved(rec)
         print(f"  Saved episode: {wrote} frames (depth camera: {camera_by_recording[rec]})")
 
     dataset.finalize()
-
-    if source_user:
-        _write_episode_sources(Path(dataset.root), saved_recordings, source_user)
-    columns = {"depth_camera": camera_by_recording}
-    if tags_by_recording is not None:
-        columns["tags"] = tags_by_recording
-    _write_episode_columns(Path(dataset.root), saved_recordings, columns)
+    write_extras()
+    checkpoints.finish()
 
     print(f"\nDataset complete: {repo_id}")
     if root:
         print(f"  Location: {root}")
+    return saved_recordings
 
 
 def _load_capture_started(ep_dir: Path) -> float | None:
@@ -720,6 +870,11 @@ def build_dataset_multi(
     depth_size: tuple[int, int] = DEPTH_SIZE,
     with_right: bool | None = None,
     with_imu: bool | None = None,
+    append: bool = False,
+    revision: str | None = None,
+    token: str | None = None,
+    checkpoint_every: int = 0,
+    on_checkpoint=None,
 ):
     """Build a LeRobot v3 dataset with a uniform, role-prefixed schema for ONE OR
     MORE arms (roles). Mono is just the single-role case of this: a lone left
@@ -733,16 +888,17 @@ def build_dataset_multi(
     (in `roles` order); `is_lost` is per-role, and so is `imu` (10 per role) when
     enabled. with_right / with_imu: None = only when every arm of every recording
     has it, True = always (recordings lacking it are skipped), False = never.
-    The episodes metadata gets a `{role}_depth_camera` column per role.
+    The episodes metadata gets a `recording` column (the episode id) and a
+    `{role}_depth_camera` column per role.
+    append / revision / token: add to the existing dataset on the Hub instead of
+    creating one (see build_dataset and _open_dataset).
+    checkpoint_every / on_checkpoint: push while building, see build_dataset.
 
     groups: {episode_id: {role: arm_episode_dir}} — one entry per synchronized
         recording. A group missing any of `roles` is skipped (can't pair it).
     The arms of one recording share a wall clock (synchronized start); we align
     them frame-exactly via each recording's capture_started_utc, using the first
     role as the reference timeline and sampling the others nearest-ts on it."""
-    from lerobot.configs import RGBEncoderConfig
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
     if fps is None:
         fps = 30.0
         print(f"Using default fps: {int(fps)}")
@@ -792,13 +948,9 @@ def build_dataset_multi(
             "names": [f"{r}_{n}" for r in slam_roles for n in IMU_NAMES],
         }
 
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id, fps=int(fps), features=features, root=root,
-        robot_type="grabette", use_videos=True,
-        rgb_encoder=RGBEncoderConfig(vcodec="h264"),
-        depth_encoder=_depth_encoder() if with_depth else None,
-        streaming_encoding=True,
-    )
+    dataset = _open_dataset(repo_id, root, fps, features, with_depth,
+                            append, revision, token)
+    first_index = dataset.meta.total_episodes
 
     # The reference timeline must be a SLAM arm (observers have no trajectory).
     ref_role = slam_roles[0]
@@ -810,7 +962,18 @@ def build_dataset_multi(
         """An arm's own time axis: SLAM trajectory ts, or observer video ts."""
         return a["cam_ts"] if "cam_ts" in a else a["traj_ts"]
 
-    for ep_id in sorted(groups):
+    def write_extras() -> list[str]:
+        if source_user:
+            _write_episode_sources(Path(dataset.root), saved, source_user, first_index)
+        columns: dict = {"recording": {r: r for r in saved}, **camera_columns}
+        if tags_by_recording is not None:
+            columns["tags"] = tags_by_recording
+        _write_episode_columns(Path(dataset.root), saved, columns, first_index)
+        return list(columns)
+
+    checkpoints = _Checkpoints(dataset, checkpoint_every, on_checkpoint, write_extras)
+    for n_done, ep_id in enumerate(sorted(groups)):
+        checkpoints.before(n_done)
         group = groups[ep_id]
         missing = [r for r in roles if r not in group]
         if missing:
@@ -932,42 +1095,52 @@ def build_dataset_multi(
         saved.append(ep_id)
         for r in slam_roles:
             camera_columns[f"{r}_depth_camera"][ep_id] = arms[r]["depth_camera"]
+        checkpoints.saved(ep_id)
         cams = ", ".join(f"{r}={arms[r]['depth_camera']}" for r in slam_roles)
         print(f"  Saved episode {ep_id}: {wrote} frames (depth camera: {cams})")
 
     dataset.finalize()
-    if source_user:
-        _write_episode_sources(Path(dataset.root), saved, source_user)
-    columns: dict = dict(camera_columns)
-    if tags_by_recording is not None:
-        columns["tags"] = tags_by_recording
-    _write_episode_columns(Path(dataset.root), saved, columns)
+    write_extras()
+    checkpoints.finish()
     print(f"\nDataset complete: {repo_id}")
+    return saved
 
 
-def _write_episode_sources(ds_root: Path, recordings: list[str], user: str) -> None:
+def _write_episode_sources(ds_root: Path, recordings: list[str], user: str,
+                           first_index: int = 0) -> None:
     """Write meta/episode_sources.json: per-episode traceability to its source
     recording and the user who produced it. Additive sidecar — LeRobot ignores it
-    on load, and push_to_hub uploads it with the rest of the dataset folder."""
-    entries = [
+    on load, and push_to_hub uploads it with the rest of the dataset folder.
+
+    recordings start at episode `first_index`. When appending to a dataset, the
+    entries of its earlier episodes (from the downloaded sidecar) are kept."""
+    out = ds_root / "meta" / "episode_sources.json"
+    kept = []
+    if first_index and out.is_file():
+        kept = [e for e in json.loads(out.read_text()).get("episodes", [])
+                if e.get("episode_index", first_index) < first_index]
+    entries = kept + [
         {
-            "episode_index": i,
+            "episode_index": first_index + i,
             "recording": rec,
             "user": user,
             "name": f"{rec}_{user}",
         }
         for i, rec in enumerate(recordings)
     ]
-    out = ds_root / "meta" / "episode_sources.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"episodes": entries}, indent=2))
     print(f"  Wrote {out.name}: {len(entries)} episode(s) tagged with user '{user}'")
 
 
 def _write_episode_columns(ds_root: Path, recordings: list[str],
-                           columns: dict[str, dict]) -> None:
+                           columns: dict[str, dict], first_index: int = 0) -> None:
     """Add per-episode columns to the LeRobot episodes metadata
     (meta/episodes/*.parquet), aligned by episode_index (= save order).
+
+    recordings are the episodes from `first_index` on. Earlier episodes (when
+    appending to an existing dataset) keep the values they already have, and
+    metadata files holding none of the new episodes are left untouched.
 
     columns: {column_name: {recording_name: value}}. A value that is a list makes
     a list<string> column (empty list when the recording has no entry, e.g.
@@ -989,7 +1162,7 @@ def _write_episode_columns(ds_root: Path, recordings: list[str],
     by_index = {
         name: {i: (list(by_rec.get(rec, [])) if is_list[name]
                    else str(by_rec.get(rec, "unknown")))
-               for i, rec in enumerate(recordings)}
+               for i, rec in enumerate(recordings, start=first_index)}
         for name, by_rec in columns.items()
     }
     files = sorted(glob.glob(str(ds_root / "meta" / "episodes" / "**" / "*.parquet"),
@@ -998,15 +1171,18 @@ def _write_episode_columns(ds_root: Path, recordings: list[str],
     for f in files:
         table = pq.read_table(f)
         indices = table.column("episode_index").to_pylist()
+        if first_index and max(indices) < first_index:
+            continue  # only earlier episodes: nothing new to write here
         for name, values in by_index.items():
+            empty = [] if is_list[name] else "unknown"
+            old = (table.column(name).to_pylist() if name in table.column_names
+                   else [empty] * len(indices))
             if name in table.column_names:
                 table = table.drop([name])
-            if is_list[name]:
-                arr = pa.array([values.get(int(i), []) for i in indices],
-                               type=pa.list_(pa.string()))
-            else:
-                arr = pa.array([values.get(int(i), "unknown") for i in indices],
-                               type=pa.string())
+            vals = [values.get(int(i), o if int(i) < first_index else empty)
+                    for i, o in zip(indices, old)]
+            arr = pa.array(vals, type=pa.list_(pa.string()) if is_list[name]
+                           else pa.string())
             table = table.append_column(name, arr)
         pq.write_table(table, f)
         total += len(indices)
@@ -1016,6 +1192,39 @@ def _write_episode_columns(ds_root: Path, recordings: list[str],
     others = [n for n in by_index if n != "tags"]
     if others:
         print(f"  Wrote per-episode {', '.join(others)}: {total} episode(s)")
+
+
+def hub_recordings(repo_id: str, revision: str = "main",
+                   token: str | None = None) -> list[str] | None:
+    """The source recording of every episode of a LeRobot dataset on the Hub, read
+    from the `recording` column of its episodes metadata (episode order).
+
+    None when the repo or revision doesn't exist, has no episodes, or was built
+    before that column existed: then it can't tell which recordings it holds."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError, \
+        RevisionNotFoundError
+
+    try:
+        files = HfApi(token=token).list_repo_files(repo_id, repo_type="dataset",
+                                                   revision=revision)
+    except (RepositoryNotFoundError, RevisionNotFoundError, EntryNotFoundError):
+        return None
+    files = sorted(f for f in files
+                   if f.startswith("meta/episodes/") and f.endswith(".parquet"))
+    rows = []
+    for f in files:
+        table = pq.read_table(hf_hub_download(repo_id, f, repo_type="dataset",
+                                              revision=revision, token=token))
+        if "recording" not in table.column_names:
+            return None
+        rows += zip(table.column("episode_index").to_pylist(),
+                    table.column("recording").to_pylist())
+    recordings = [rec for _, rec in sorted(rows)]
+    if not recordings or any(r in (None, "", "unknown") for r in recordings):
+        return None
+    return recordings
 
 
 def _write_episode_tags(ds_root: Path, recordings: list[str],

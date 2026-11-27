@@ -269,9 +269,54 @@ def episode_label(ep: Path) -> str:
     return f"{ep.parent.name}/{ep.name}" if ep.name in ROLE_SLOTS else ep.name
 
 
+# The dataset is pushed every BATCH_SIZE converted recordings, then the build
+# continues in the same files. A crash loses at most one batch of conversion (SLAM
+# still runs on everything first). 0 = build everything, then push once.
+BATCH_SIZE = int(os.environ.get("GRABETTE_BATCH_SIZE", "10"))
+
+
+def recording_id(ep) -> str:
+    """The source recording an episode dir belongs to: the recording id in the
+    fleet's role layout ({episode_id}/{role}), the dir name in the flat one. This
+    is what the dataset's `recording` column holds."""
+    ep = Path(ep)
+    return ep.parent.name if ep.name in ROLE_SLOTS else ep.name
+
+
+def source_recording_ids(api, source_repo) -> set[str]:
+    """Recording ids of a raw dataset on the Hub, from its file list (no download):
+    every dir holding a depth-camera recording, named as recording_id does."""
+    anchors = ("dcam_left.mp4", "oakd_left.mp4")
+    files = api.list_repo_files(source_repo, repo_type="dataset")
+    return {recording_id(Path(f).parent) for f in files if Path(f).name in anchors}
+
+
+def resume_point(target_repo, revision, source_ids, token=None, log=print):
+    """Recordings already in `target_repo` at `revision`, when a run can continue
+    it; None when it must start a new dataset there.
+
+    A run continues the target only if every episode in it records its source
+    recording (`recording` column) and all of them come from this source: a
+    previous run of the same source → target, cut short. Any other existing
+    dataset is left alone (None), so a mistyped target is never appended to."""
+    from grabette_postprocess.dataset import hub_recordings
+
+    done = hub_recordings(target_repo, revision=revision, token=token)
+    if done is None:
+        return None
+    foreign = set(done) - set(source_ids)
+    if foreign:
+        log(f"  {target_repo} holds {len(foreign)} recording(s) that aren't in this "
+            f"source (e.g. {sorted(foreign)[0]}), so it won't be continued.")
+        return None
+    return set(done)
+
+
 def build_recordings(target_repo, task, root, episodes, report_by_ep,
                      roles=None, source_user=None, log=print, keep=None,
-                     declined=()) -> list:
+                     declined=(), batch_size=0, on_batch=None, append=False,
+                     revision=None, token=None, should_stop=None,
+                     gate=None) -> list:
     """Build the LeRobot dataset on disk from the kept episode dirs, picking the
     schema from the raw layout. Shared by the UI run (build_lerobot) and the
     headless REST run so both produce the SAME dataset for the same raw input.
@@ -288,6 +333,16 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
     keep: optional content to keep (CONTENT_OPTIONS keys, see content_kwargs);
         None = no choice (depth kept, right / IMU only when every episode has them).
 
+    batch_size / on_batch: one dataset is built under `root`, and every
+        `batch_size` recordings (0 = only at the end) it is made complete on disk
+        and handed to on_batch(root, new_recordings, index, n_batches, final),
+        which pushes it. The build then continues in the same files, so the
+        pushed dataset has the same files as one built in a single go.
+    append / revision / token: add to the existing dataset `target_repo` at
+        `revision` instead of creating it (a resumed run).
+    should_stop / gate: checked after each intermediate push (stop there, or
+        pause before building the next batch).
+
     Returns the list of built recordings (recording ids in the role layout,
     episode dirs in the flat one); callers use its length as the episode count.
     """
@@ -302,11 +357,19 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
         content, lines = content_plan(episodes, keep, unit="episode",
                                       declined=declined)
         _log_content(lines, log)
+        by_name = {Path(ep).name: ep for ep in episodes}
+
+        def build_flat(every, on_checkpoint):
+            return build_dataset(
+                repo_id=target_repo, episode_dirs=list(episodes), task=task, root=root,
+                source_user=source_user, tags_by_recording=tags_by_recording,
+                append=append, revision=revision, token=token,
+                checkpoint_every=every, on_checkpoint=on_checkpoint, **content)
+
         log(f"Building LeRobot dataset from {len(episodes)} episode(s)…")
-        build_dataset(repo_id=target_repo, episode_dirs=episodes, task=task,
-                      root=Path(root), source_user=source_user,
-                      tags_by_recording=tags_by_recording, **content)
-        return list(episodes)
+        return _build_checkpointed(len(episodes), build_flat, root, batch_size,
+                                   on_batch, log, should_stop, gate,
+                                   to_items=lambda names: [by_name[n] for n in names])
 
     # Role layout: pair the per-arm dirs back into one LeRobot episode each. A
     # recording missing an arm can't be paired (the arm was dropped in review or
@@ -346,12 +409,49 @@ def build_recordings(target_repo, task, root, episodes, report_by_ep,
         [group[r] for group in groups.values() for r in roles], keep,
         unit="arm recording", declined=declined)
     _log_content(lines, log)
+    def build_multi(every, on_checkpoint):
+        return build_dataset_multi(
+            repo_id=target_repo, groups=groups, roles=roles, task=task, root=root,
+            source_user=source_user, tags_by_recording=tags_by_recording,
+            append=append, revision=revision, token=token,
+            checkpoint_every=every, on_checkpoint=on_checkpoint, **content)
+
     log(f"Building LeRobot dataset ({'+'.join(roles)}) from "
         f"{len(groups)} recording(s)…")
-    build_dataset_multi(repo_id=target_repo, groups=groups, roles=roles, task=task,
-                        root=Path(root), source_user=source_user,
-                        tags_by_recording=tags_by_recording, **content)
-    return sorted(groups)
+    return _build_checkpointed(len(groups), build_multi, root, batch_size,
+                               on_batch, log, should_stop, gate)
+
+
+def _build_checkpointed(n_items, build, root, batch_size, on_batch, log,
+                        should_stop=None, gate=None, to_items=None) -> list:
+    """Run build(checkpoint_every, on_checkpoint) -> saved names, handing the
+    dataset to on_batch every `batch_size` recordings (see build_recordings).
+    to_items maps the builder's recording names back to the caller's items."""
+    to_items = to_items or list
+    every = batch_size if batch_size and 0 < batch_size < n_items else 0
+    n_batches = -(-n_items // every) if every else 1
+    if every and on_batch is None:
+        raise ValueError("Pushing in batches needs on_batch to push each batch.")
+    done = {"k": 0, "n": 0}
+
+    def on_checkpoint(names, final):
+        k = done["k"]
+        on_batch(Path(root), to_items(names), k, n_batches, final)
+        done["k"], done["n"] = k + 1, done["n"] + len(names)
+        if final:
+            return
+        if gate:
+            gate()  # pause point between batches
+        if should_stop and should_stop():
+            raise RuntimeError(
+                f"Stopped by user after {done['n']} recording(s) were pushed. Run the "
+                f"same source → target again to continue.")
+        log(f"\n=== Batch {k + 2}/{n_batches} ===")
+
+    if every:
+        log(f"Pushing every {every} recording(s) ({n_batches} batches).\n"
+            f"=== Batch 1/{n_batches} ===")
+    return to_items(build(every, on_checkpoint if on_batch else None))
 
 
 def _run_parallel(episodes, fn, log, on_progress, phase, gate, should_stop):
@@ -601,7 +701,9 @@ def _push_to_branch(ds, target_repo, branch, log, token, attempts=3):
 def build_lerobot(dataset_dir, target_repo, task, root, log=print,
                   should_stop=None, to_branch=False, on_progress=None,
                   token=None, gate=None, pre_review=None, review=None,
-                  run_sync=False, keep=None, content_review=None) -> list:
+                  run_sync=False, keep=None, content_review=None,
+                  skip_recordings=(), batch_size=0, on_batch=None,
+                  append=False, revision=None) -> list:
     """Check + SLAM + build the LeRobot dataset on disk under `root`.
 
     Pipeline: completeness/sync prechecks → (pre_review drop) → (content review)
@@ -636,6 +738,10 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
         all of the kept episodes (see content_gaps). For each, the user decides:
         drop the stream, or exclude the episodes without it. Without it, a ticked
         stream excludes those episodes at build time.
+    skip_recordings: recording ids already in the target (a resumed run, see
+        resume_point); their episodes are left out before any check or SLAM.
+    batch_size / on_batch / append / revision: build and push in batches, and
+        append to the existing target (see build_recordings).
     """
     content_kwargs(keep)  # reject a bad option before the slow SLAM, not after
     # No global HF_TOKEN here: this function only builds locally and resolves the
@@ -646,6 +752,15 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
         raise ValueError(f"No episodes (dcam_left.mp4 or legacy oakd_left.mp4) found under {dataset_dir}")
     log(f"Found {len(episodes)} episode(s) : "
         f"{', '.join(episode_label(ep) for ep in episodes)}")
+    if skip_recordings:
+        skip = set(skip_recordings)
+        todo = [ep for ep in episodes if recording_id(ep) not in skip]
+        log(f"Continuing {target_repo}: {len(skip)} recording(s) already in it, "
+            f"{len({recording_id(ep) for ep in todo})} left to process.")
+        episodes = todo
+        if not episodes:
+            log("✅ Every recording is already in the target — nothing to do.")
+            return []
 
     # ---- Pre-SLAM phase: completeness + sync checks, then optional drop --------
     checks = precheck_episodes(episodes, log=log, should_stop=should_stop,
@@ -724,7 +839,9 @@ def build_lerobot(dataset_dir, target_repo, task, root, log=print,
     report_by_ep = {ep: report for ep, report in results}
     return build_recordings(target_repo, task, root, processed, report_by_ep,
                             source_user=source_user, log=log, keep=keep,
-                            declined=declined)
+                            declined=declined, batch_size=batch_size,
+                            on_batch=on_batch, append=append, revision=revision,
+                            token=token, should_stop=should_stop, gate=gate)
 
 
 def push_lerobot(target_repo, task, root, n_episodes, to_branch=False,
@@ -760,7 +877,10 @@ def push_lerobot(target_repo, task, root, n_episodes, to_branch=False,
         if token:
             os.environ["HF_TOKEN"] = token
         try:
-            ds = LeRobotDataset(target_repo, root=Path(root))
+            # resume() reads only the local metadata. After a resumed run `root`
+            # holds the dataset's metadata plus the new episodes, not the earlier
+            # files, and LeRobotDataset() would download what's missing from the Hub.
+            ds = LeRobotDataset.resume(target_repo, root=Path(root), token=token)
 
             if gate:
                 gate()  # pause checkpoint before the upload
